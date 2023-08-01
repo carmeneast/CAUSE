@@ -130,6 +130,7 @@ def train_nn_models(model, event_seqs, args):
     model.train()
     best_metric = float("nan")
 
+    train_loss, valid_loss = [], []
     for epoch in range(args.epochs):
         train_metrics, valid_metrics = model.train_epoch(
             train_dataloader,
@@ -138,6 +139,8 @@ def train_nn_models(model, event_seqs, args):
             device=device,
             **vars(args),
         )
+        train_loss.append(train_metrics['loss'].avg)
+        valid_loss.append(valid_metrics['loss'].avg)
 
         msg = f"[Training] Epoch={epoch}"
         for k, v in train_metrics.items():
@@ -157,8 +160,9 @@ def train_nn_models(model, event_seqs, args):
             torch.save(model.state_dict(), osp.join(output_path, "model.pt"))
 
     model.load_state_dict(torch.load(osp.join(output_path, "model.pt")))
+    history = pd.DataFrame({'epoch': range(args.epochs), 'train': train_loss, 'valid': valid_loss})
 
-    return model
+    return model, history
 
 
 def eval_nll(model, event_seqs, args):
@@ -277,7 +281,7 @@ if __name__ == "__main__":
             device = get_device(args.cuda)
 
             model = model.to(device)
-            model = train_nn_models(model, train_event_seqs, args)
+            model, history = train_nn_models(model, train_event_seqs, args)
 
         else:
             # NOTE: may change to weighted sampling (by seq length)
@@ -295,6 +299,15 @@ if __name__ == "__main__":
             # write a wrapper class.
             # with open(osp.join(output_path, "model.pkl"), "wb") as f:
             # pickle.dump(model, f)
+
+    # Plot training and validation loss
+    import matplotlib.pyplot as plt
+    plt.plot(history['train'], label='train')
+    plt.plot(history['valid'], label='valid')
+    plt.xlabel('epoch')
+    plt.ylabel('loss')
+    plt.legend()
+    plt.show()
 
     # evaluate nll
     results = {}

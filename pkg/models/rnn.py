@@ -27,9 +27,14 @@ class EventSeqDataset(Dataset):
 
         self.min_length = min_length
         self._event_seqs = [
-            torch.FloatTensor(seq)
+            torch.sparse_coo_tensor(
+                indices=torch.Tensor([seq.row, seq.col]),
+                values=seq.data,
+                size=seq.shape,
+                dtype=torch.float32
+            ).to_dense()  # torch.FloatTensor(seq)
             for seq in event_seqs
-            if len(seq) >= min_length
+            if seq.shape[0] >= min_length  # if len(seq) >= min_length
         ]
         if sort_by_length:
             self._event_seqs = sorted(self._event_seqs, key=lambda x: -len(x))
@@ -86,13 +91,14 @@ class ExplainableRecurrentPointProcess(nn.Module):
         max_mean: float,
         embedding_dim: int = 32,
         hidden_size: int = 32,
-        n_bases: int = 4,
+        # n_bases: int = 4,
+        basis_means: list[int] = None,
         basis_type: str = "normal",
         dropout: float = 0.0,
         rnn: str = "GRU",
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.n_types = n_types
 
         self.embed = nn.Linear(n_types, embedding_dim, bias=False)
@@ -104,6 +110,10 @@ class ExplainableRecurrentPointProcess(nn.Module):
             dropout=dropout,
         )
 
+        if basis_means is None:
+            basis_means = [1]
+        n_bases = len(basis_means)
+
         self.bases = [Unity()]
         if basis_type == "equal":
             loc, scale = [], []
@@ -111,12 +121,14 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 loc.append(i * max_mean / (n_bases - 1))
                 scale.append(max_mean / (n_bases - 1))
         elif basis_type == "dyadic":
-            L = max_mean / 2 ** (n_bases - 1)
-            loc, scale = [0], [L / 3]
-            for i in range(1, n_bases):
-                loc.append(L)
-                scale.append(L / 3)
-                L *= 2
+            # L = max_mean / 2 ** (n_bases - 1)
+            # loc, scale = [0], [L / 3]
+            # for i in range(1, n_bases):
+            #     loc.append(L)
+            #     scale.append(L / 3)
+            #     L *= 2
+            loc = basis_means  # [1, 7, 14, 30, 45, 60, 90, 180, 365]
+            scale = [max(1/3, lo/3) for lo in loc]
         else:
             raise ValueError(f"unrecognized basis_type={basis_type}")
 
@@ -128,17 +140,17 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.shallow_net = ResidualLayer(hidden_size, n_types * (n_bases + 1))
 
     def forward(
-        self, event_seqs, onehot=False, need_weights=True, target_type=-1
+        self, event_seqs, onehot=True, need_weights=True, target_type=-1
     ):
         """[summary]
 
         Args:
           event_seqs (Tensor): shape=[batch_size, T, 2]
             or [batch_size, T, 1 + n_types]. The last dimension
-            denotes the timestamp and the type of an event, respectively.
+            denotes the timestamp and the type of event, respectively.
 
           onehot (bool): whether the event types are represented by one-hot
-            vetors.
+            vectors.
 
           need_weights (bool): whether to return the basis weights.
 
@@ -183,9 +195,10 @@ class ExplainableRecurrentPointProcess(nn.Module):
         log_basis_weights = self.shallow_net(history_emb).view(
             batch_size, T, self.n_types, -1
         )
+        log_basis_weights = torch.clamp(log_basis_weights, max=30)
         if target_type >= 0:
             log_basis_weights = log_basis_weights[
-                :, :, target_type : target_type + 1
+                :, :, target_type: target_type + 1
             ]
 
         # [B, T, 1, R]
@@ -221,11 +234,13 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self, batch, log_intensities, log_basis_weights, mask, debug=False
     ):
 
+        # NLL of events that occurred
         loss_part1 = (
-            -log_intensities.gather(dim=2, index=batch[:, :, 1:].long())
-            .squeeze(-1)
-            .masked_select(mask)
-            .sum()
+            # -log_intensities.gather(dim=2, index=batch[:, :, 1:].long())
+            # .squeeze(-1)
+            # .masked_select(mask)
+            # .sum()
+            sum([-log_intensities[i][j][k] for i, j, k in torch.nonzero(batch[:, :, 1:])])
         )
 
         loss_part2 = (
@@ -242,7 +257,8 @@ class ExplainableRecurrentPointProcess(nn.Module):
         else:
             return (loss_part1 + loss_part2) / batch.size(0)
 
-    def _eval_acc(self, batch, intensities, mask):
+    @staticmethod
+    def _eval_acc(batch, intensities, mask):
         types_pred = intensities.argmax(dim=-1).masked_select(mask)
         types_true = batch[:, :, 1].long().masked_select(mask)
         return (types_pred == types_true).float().mean()
@@ -394,7 +410,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 i = 0
                 for b, L in enumerate(seq_length):
                     # reconstruct the actually timestamps
-                    seq = t_pred[i : i + L] + F.pad(
+                    seq = t_pred[i: i + L] + F.pad(
                         batch[b, : L - 1, 0], (1, 0)
                     )
                     # TODO: pad the event type as type prediction hasn't been
@@ -422,7 +438,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             return cumulants[:, 1:]
 
         set_eval_mode(self)
-        # freeze the model parameters to reduce unnecessary backpropogation.
+        # freeze the model parameters to reduce unnecessary backpropagation.
         for param in self.parameters():
             param.requires_grad_(False)
 
@@ -486,7 +502,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             )
             type_counts.scatter_add_(0, index=ks, src=torch.ones_like(ks))
 
-        # plus one to avoid divison by zero
+        # plus one to avoid division by zero
         A /= type_counts[None, :].float() + 1
 
         return A.detach().cpu()
