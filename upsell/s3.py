@@ -79,7 +79,7 @@ def save_pytorch_model(model, bucket, tenant_id):
     s3.put_object(Bucket=bucket, Key=f'upsell/{tenant_id}/model.pt', Body=buffer.getvalue())
 
 
-def load_pytorch_object(tenant_id, bucket, name):
+def load_pytorch_object(bucket, tenant_id, name):
     s3 = boto3.resource('s3')
     with BytesIO() as data:
         s3.Bucket(bucket).download_fileobj(f'upsell/{tenant_id}/{name}.pt', data)

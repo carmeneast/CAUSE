@@ -34,6 +34,7 @@ train:
   attr_batch_size: 8
   occurred_type_only: True
   tune_metric: 'nll'
+  patience: 2
 
 predict:
   min_days: 1

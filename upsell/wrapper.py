@@ -50,7 +50,8 @@ class CauseWrapper:
         print(f'NLL: {nll}')
 
         # Predicts future event intensities on test set
-        intensities, cumulants, log_basis_weights = self.predict(test_event_seqs, days=range(1, 31))
+        days = range(self.CONFIG.predict.min_days, self.CONFIG.predict.max_days + 1)
+        intensities, cumulants, log_basis_weights = self.predict(test_event_seqs, days=days)
         print(intensities.shape, cumulants.shape, log_basis_weights.shape)
 
     def get_device(self, dynamic=False):
@@ -92,7 +93,7 @@ class CauseWrapper:
                 train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset]
             )
         valid_data_loader = convert_to_bucketed_dataloader(
-            train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset], shuffle_same_key=False
+            valid_data_loader, keys=[x.shape[0] for x in valid_data_loader.dataset], shuffle_same_key=False
         )
         return train_data_loader, valid_data_loader
 
@@ -108,7 +109,6 @@ class CauseWrapper:
 
         self.model.train()
 
-        patience = 2
         best_metric = float('inf')
         best_epoch = 0
 
@@ -136,15 +136,15 @@ class CauseWrapper:
             if valid_metrics[configs.tune_metric].avg < best_metric:
                 best_epoch = epoch
                 best_metric = valid_metrics[configs.tune_metric].avg
-                save_pytorch_model(self.model, self.tenant_id, self.bucket)
+                save_pytorch_model(self.model, self.bucket, self.tenant_id)
 
-            if epoch - best_epoch >= patience:
+            if epoch - best_epoch >= configs.patience:
                 print(f'Stopped training early at epoch {epoch}: ' +
-                      f'Failed to improve validation {configs.tune_metric} in last {patience} epochs')
+                      f'Failed to improve validation {configs.tune_metric} in last {configs.patience} epochs')
                 break
 
         # Reset model to the last-saved (best) version of the model
-        self.model = load_pytorch_object(self.tenant_id, self.bucket, 'model')
+        self.model = load_pytorch_object(self.bucket, self.tenant_id, 'model')
         history = pd.DataFrame({'epoch': range(epoch + 1), 'train': train_loss, 'valid': valid_loss})
         return history
 
@@ -172,7 +172,7 @@ class CauseWrapper:
         data_loader = DataLoader(
             EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
         )
-        intensities, cumulants, log_basis_weights = self.model.predict_event_intensities(data_loader, days)
+        intensities, cumulants, log_basis_weights = self.model.predict_event_intensities(data_loader, self.device, days)
 
         save_pytorch_dataset(intensities, self.bucket, self.tenant_id, 'event_intensities')
         save_pytorch_dataset(cumulants, self.bucket, self.tenant_id, 'event_cumulants')

@@ -331,14 +331,15 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         return metrics
 
-    def predict_event_intensities(self, data_loader, days=range(1, 31)):
+    def predict_event_intensities(self, data_loader, device, days=range(1, 31)):
         batch_intensities, batch_cumulants, batch_log_basis_weights = [], [], []
         with torch.no_grad():
             for batch in tqdm(data_loader):
-                batch = batch.to(self.device)
+                if device:
+                    batch = batch.to(device)
 
                 seq_length = (batch.abs().sum(-1) > 0).sum(-1)
-                _, log_basis_weights = self.model.forward(batch, need_weights=True)
+                _, log_basis_weights = self.forward(batch, need_weights=True)
 
                 # Get the basis weights for the last event vector in each account [B, K, R]
                 last_log_basis_weights = torch.cat(
@@ -348,7 +349,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
                 # PDF -> INTENSITIES
                 # Get the probability for day = dt from each basis function [days, R]
-                log_probas = torch.cat([basis.log_prob(dt) for basis in self.model.bases], dim=1)
+                log_probas = torch.cat([basis.log_prob(dt) for basis in self.bases], dim=1)
 
                 # Multiply probas by basis weights [B, K, days]
                 intensities = np.exp(last_log_basis_weights.unsqueeze(2) + log_probas).sum(-1)
@@ -356,7 +357,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 # CDF -> CUMULANTS
                 # Integrate each basis function from 0 to t [days, R]
                 integrals = torch.cat([basis.cdf(dt) - basis.cdf(torch.zeros_like(dt))
-                                       for basis in self.model.bases], dim=-1)
+                                       for basis in self.bases], dim=-1)
 
                 # Multiply integrals by basis weights [B, K, days]
                 cumulants = integrals.mul(last_log_basis_weights.unsqueeze(2).exp()).sum(-1)
