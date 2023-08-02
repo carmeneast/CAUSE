@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
-from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from pkg.explain.integrated_gradient import batch_integrated_gradient
@@ -13,124 +12,66 @@ from pkg.utils.torch import ResidualLayer, generate_sequence_mask, set_eval_mode
 from pkg.models.func_basis import Normal, Unity
 
 
-class EventSeqDataset(Dataset):
-    """
-    Dataset for storing event sequences.
-    :param event_seqs: List[List[(timestamp, event_type)]]
-    :param min_length: int
-    :param sort_by_length: bool
-    """
-
-    def __init__(self, event_seqs, min_length=1, sort_by_length=False):
-        self.min_length = min_length
-        self._event_seqs = [
-            torch.sparse_coo_tensor(
-                indices=torch.Tensor([seq.row, seq.col]),
-                values=seq.data,
-                size=seq.shape,
-                dtype=torch.float32
-            ).to_dense()
-            for seq in event_seqs
-            if seq.shape[0] >= min_length
-        ]
-        if sort_by_length:
-            self._event_seqs = sorted(self._event_seqs, key=lambda x: -len(x))
-
-    def __len__(self):
-        return len(self._event_seqs)
-
-    def __getitem__(self, i):
-        # TODO: can instead compute the elapsed time between events
-        return self._event_seqs[i]
-
-    @staticmethod
-    def collate_fn(x):
-        return nn.utils.rnn.pad_sequence(x, batch_first=True)
-
-
-class EventSeqWithLabelDataset(Dataset):
-    """Construct a dataset for store event sequences.
-
-    Args:
-        event_seqs: List[List[(timestamp, event_type)]]
-        labels: List[List[labels]] (labels can be of any type, e.g. intensities)
-    """
-
-    def __init__(self, event_seqs, labels, label_dtype=torch.float):
-        self._event_seqs = [np.asarray(seq) for seq in event_seqs]
-        self._labels = [np.asarray(_labels) for _labels in labels]
-        self._label_dtype = label_dtype
-
-    def __len__(self):
-        return len(self._event_seqs)
-
-    def __getitem__(self, i):
-        return (
-            torch.from_numpy(self._event_seqs[i]).float(),
-            torch.from_numpy(self._labels[i]).to(self._label_dtype),
-        )
-
-    @staticmethod
-    def collate_fn(batch):
-        batch_X, batch_y = zip(*batch)
-
-        return (
-            nn.utils.rnn.pad_sequence(batch_X, batch_first=True),
-            nn.utils.rnn.pad_sequence(batch_y, batch_first=True),
-        )
-
-
 class ExplainableRecurrentPointProcess(nn.Module):
     def __init__(
             self,
             n_types: int,
-            max_mean: float = None,
+            # Neural networks
             embedding_dim: int = 32,
             hidden_size: int = 32,
-            basis_means: list = None,
-            basis_type: str = "normal",
-            dropout: float = 0.0,
             rnn: str = "GRU",
+            dropout: float = 0.0,
+            max_log_basis_weight: float = 30.0,
+            # Basis functions
+            basis_type: str = "normal",
+            n_bases: int = None,
+            max_mean: float = None,
+            basis_means: list = None,
             **kwargs
     ):
         super().__init__(**kwargs)
         self.n_types = n_types
+        self.max_log_basis_weight = max_log_basis_weight
 
-        self.embed = nn.Linear(n_types, embedding_dim, bias=False)
+        if (n_bases is None or max_mean is None) and basis_means is None:
+            raise ValueError('Either (n_bases and max_mean) or basis_means must be specified.')
+
+        self.bases = self.define_basis_functions(basis_type, n_bases=n_bases, max_mean=max_mean,
+                                                 basis_means=basis_means)
+
+        self.embedder = nn.Linear(n_types, embedding_dim, bias=False)
         self.dropout = nn.Dropout(p=dropout)
-        self.seq_encoder = getattr(nn, rnn)(
+        self.encoder = getattr(nn, rnn)(
             input_size=embedding_dim + 1,
             hidden_size=hidden_size,
             batch_first=True,
             dropout=dropout,
         )
+        self.decoder = ResidualLayer(hidden_size, n_types * len(self.bases))
 
-        if basis_means is None:
-            basis_means = [1]
-        n_bases = len(basis_means)
-
-        self.bases = [Unity()]
+    @staticmethod
+    def define_basis_functions(basis_type, n_bases=None, max_mean=None, basis_means=None):
+        bases = [Unity()]
         if basis_type == 'equal':
+            assert n_bases is not None and max_mean is not None
             loc, scale = [], []
             for i in range(n_bases):
                 loc.append(i * max_mean / (n_bases - 1))
                 scale.append(max_mean / (n_bases - 1))
         elif basis_type == 'dyadic':
-            loc = basis_means
-            scale = [max(1 / 3, lo / 3) for lo in loc]
+            if basis_means is not None:
+                loc = sorted(basis_means)
+                scale = [loc[1] / (2 * 3)] + [mu / 3 for mu in loc[1:]]
+            else:
+                loc = [0] + sorted([max_mean / 2 ** i for i in range(n_bases-1)])
+                scale = [max_mean / 2 ** (n_bases-1) / 3] + [mu / 3 for mu in loc[1:]]
         else:
             raise ValueError(f'Unrecognized basis_type={basis_type}')
 
-        self.bases.append(Normal(loc=loc, scale=scale))
-        self.bases = nn.ModuleList(self.bases)
+        bases.append(Normal(loc=loc, scale=scale))
+        return nn.ModuleList(bases)
 
-        self.dropout = nn.Dropout(p=dropout)
-
-        self.shallow_net = ResidualLayer(hidden_size, n_types * (n_bases + 1))
-
-    def forward(
-            self, event_seqs, onehot=True, need_weights=True, target_type=-1
-    ):
+    def forward(self, event_seqs, onehot=True, need_weights=True, target_type=-1):
         """[summary]
 
         Args:
@@ -169,22 +110,22 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         # (0, z_1, ..., z_{n - 1})
         if onehot:
-            type_feat = self.embed(event_seqs[:, :-1, 1:])
+            type_feat = self.embedder(event_seqs[:, :-1, 1:])
         else:
-            type_feat = self.embed(
+            type_feat = self.embedder(
                 f.one_hot(event_seqs[:, :-1, 1].long(), self.n_types).float()
             )
         type_feat = f.pad(type_feat, (0, 0, 1, 0))
 
         feat = torch.cat([temp_feat, type_feat], dim=-1)
-        history_emb, *_ = self.seq_encoder(feat)
+        history_emb, *_ = self.encoder(feat)
         history_emb = self.dropout(history_emb)
 
         # [B, T, K or 1, R]
-        log_basis_weights = self.shallow_net(history_emb).view(
+        log_basis_weights = self.decoder(history_emb).view(
             batch_size, T, self.n_types, -1
         )
-        log_basis_weights = torch.clamp(log_basis_weights, max=30)
+        log_basis_weights = torch.clamp(log_basis_weights, max=self.max_log_basis_weight)
         if target_type >= 0:
             log_basis_weights = log_basis_weights[
                                 :, :, target_type: target_type + 1
@@ -203,7 +144,8 @@ class ExplainableRecurrentPointProcess(nn.Module):
             return log_intensities
 
     def _eval_cumulants(self, batch, log_basis_weights):
-        """Evaluate the cumulants (i.e., integral of CIFs at each location)
+        """
+        Evaluate the cumulants (i.e., integral of CIFs at each location)
         """
         ts = batch[:, :, 0]
         # (t1 - t0, ..., t_n - t_{n - 1})
@@ -219,14 +161,15 @@ class ExplainableRecurrentPointProcess(nn.Module):
         cumulants = integrals.unsqueeze(2).mul(log_basis_weights.exp()).sum(-1)
         return cumulants
 
-    def _eval_nll(
-            self, batch, log_intensities, log_basis_weights, mask, debug=False
-    ):
-
+    def _eval_nll(self, batch, log_intensities, log_basis_weights, mask, debug=False):
         # Probability of the events that actually occurred at t_i+1
-        loss_part1 = (
-            sum([-log_intensities[i][j][k] for i, j, k in torch.nonzero(batch[:, :, 1:])])
-        )
+        loss_part1 = sum([
+            # Multiply the intensity for the account+time+event_type by the weight of the event type
+            #   --> weight could represent the number of times the event occurred, number of keywords, etc.
+            -log_intensities[i][j][k] * batch[i][j][k+1]
+            for i, j, k in
+            torch.nonzero(batch[:, :, 1:])  # list of indices of events that occurred
+        ])
 
         # Probability that no other events occurred between t_i and t_i+1
         loss_part2 = (
@@ -236,12 +179,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
             .sum()
         )
         if debug:
-            return (
-                (loss_part1 + loss_part2) / batch.size(0),
-                loss_part1 / batch.size(0),
-            )
-        else:
-            return (loss_part1 + loss_part2) / batch.size(0)
+            print('loss_part1', loss_part1)
+            print('loss_part2', loss_part2)
+            print('batch.size(0)', batch.size(0))
+            print('nll', (loss_part1 + loss_part2) / batch.size(0))
+
+        return (loss_part1 + loss_part2) / batch.size(0)
 
     @staticmethod
     def _eval_acc(batch, intensities, mask):
