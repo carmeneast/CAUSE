@@ -1,35 +1,37 @@
-"""Recurrent Mark Density Estimator
-"""
 from collections import defaultdict
 from functools import partial
-
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as f
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from ..explain.integrated_gradient import batch_integrated_gradient
-from ..utils.misc import AverageMeter
-from ..utils.torch import ResidualLayer, generate_sequence_mask, set_eval_mode
-from .func_basis import Normal, Unity
+from pkg.explain.integrated_gradient import batch_integrated_gradient
+from pkg.utils.misc import AverageMeter
+from pkg.utils.torch import ResidualLayer, generate_sequence_mask, set_eval_mode
+from pkg.models.func_basis import Normal, Unity
 
 
 class EventSeqDataset(Dataset):
-    """Construct a dataset for store event sequences.
-
-    Args:
-        event_seqs (list of list of 2-tuples):
+    """
+    Dataset for storing event sequences.
+    :param event_seqs: List[List[(timestamp, event_type)]]
+    :param min_length: int
+    :param sort_by_length: bool
     """
 
     def __init__(self, event_seqs, min_length=1, sort_by_length=False):
-
         self.min_length = min_length
         self._event_seqs = [
-            torch.FloatTensor(seq)
+            torch.sparse_coo_tensor(
+                indices=torch.Tensor([seq.row, seq.col]),
+                values=seq.data,
+                size=seq.shape,
+                dtype=torch.float32
+            ).to_dense()
             for seq in event_seqs
-            if len(seq) >= min_length
+            if seq.shape[0] >= min_length
         ]
         if sort_by_length:
             self._event_seqs = sorted(self._event_seqs, key=lambda x: -len(x))
@@ -42,20 +44,19 @@ class EventSeqDataset(Dataset):
         return self._event_seqs[i]
 
     @staticmethod
-    def collate_fn(X):
-        return nn.utils.rnn.pad_sequence(X, batch_first=True)
+    def collate_fn(x):
+        return nn.utils.rnn.pad_sequence(x, batch_first=True)
 
 
 class EventSeqWithLabelDataset(Dataset):
     """Construct a dataset for store event sequences.
 
     Args:
-        event_seqs (list of list of 2-tuples):
-        labels: (list of list of some kind of labels (e.g., intensities))
+        event_seqs: List[List[(timestamp, event_type)]]
+        labels: List[List[labels]] (labels can be of any type, e.g. intensities)
     """
 
     def __init__(self, event_seqs, labels, label_dtype=torch.float):
-
         self._event_seqs = [np.asarray(seq) for seq in event_seqs]
         self._labels = [np.asarray(_labels) for _labels in labels]
         self._label_dtype = label_dtype
@@ -81,18 +82,18 @@ class EventSeqWithLabelDataset(Dataset):
 
 class ExplainableRecurrentPointProcess(nn.Module):
     def __init__(
-        self,
-        n_types: int,
-        max_mean: float,
-        embedding_dim: int = 32,
-        hidden_size: int = 32,
-        n_bases: int = 4,
-        basis_type: str = "normal",
-        dropout: float = 0.0,
-        rnn: str = "GRU",
-        **kwargs,
+            self,
+            n_types: int,
+            max_mean: float,
+            embedding_dim: int = 32,
+            hidden_size: int = 32,
+            basis_means: list[int] = None,
+            basis_type: str = "normal",
+            dropout: float = 0.0,
+            rnn: str = "GRU",
+            **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.n_types = n_types
 
         self.embed = nn.Linear(n_types, embedding_dim, bias=False)
@@ -104,21 +105,21 @@ class ExplainableRecurrentPointProcess(nn.Module):
             dropout=dropout,
         )
 
+        if basis_means is None:
+            basis_means = [1]
+        n_bases = len(basis_means)
+
         self.bases = [Unity()]
-        if basis_type == "equal":
+        if basis_type == 'equal':
             loc, scale = [], []
             for i in range(n_bases):
                 loc.append(i * max_mean / (n_bases - 1))
                 scale.append(max_mean / (n_bases - 1))
-        elif basis_type == "dyadic":
-            L = max_mean / 2 ** (n_bases - 1)
-            loc, scale = [0], [L / 3]
-            for i in range(1, n_bases):
-                loc.append(L)
-                scale.append(L / 3)
-                L *= 2
+        elif basis_type == 'dyadic':
+            loc = basis_means
+            scale = [max(1 / 3, lo / 3) for lo in loc]
         else:
-            raise ValueError(f"unrecognized basis_type={basis_type}")
+            raise ValueError(f'Unrecognized basis_type={basis_type}')
 
         self.bases.append(Normal(loc=loc, scale=scale))
         self.bases = nn.ModuleList(self.bases)
@@ -128,17 +129,17 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.shallow_net = ResidualLayer(hidden_size, n_types * (n_bases + 1))
 
     def forward(
-        self, event_seqs, onehot=False, need_weights=True, target_type=-1
+            self, event_seqs, onehot=True, need_weights=True, target_type=-1
     ):
         """[summary]
 
         Args:
           event_seqs (Tensor): shape=[batch_size, T, 2]
             or [batch_size, T, 1 + n_types]. The last dimension
-            denotes the timestamp and the type of an event, respectively.
+            denotes the timestamp and the type of event, respectively.
 
           onehot (bool): whether the event types are represented by one-hot
-            vetors.
+            vectors.
 
           need_weights (bool): whether to return the basis weights.
 
@@ -160,9 +161,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
         batch_size, T = event_seqs.size()[:2]
 
         # (t0=0, t1, t2, ..., t_n)
-        ts = F.pad(event_seqs[:, :, 0], (1, 0))
+        ts = f.pad(event_seqs[:, :, 0], (1, 0))
         # (0, t1 - t0, ..., t_{n} - t_{n - 1})
-        dt = F.pad(ts[:, 1:] - ts[:, :-1], (1, 0))
+        dt = f.pad(ts[:, 1:] - ts[:, :-1], (1, 0))
         # (0, t1 - t0, ..., t_{n - 1} - t_{n - 2})
         temp_feat = dt[:, :-1].unsqueeze(-1)
 
@@ -171,9 +172,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
             type_feat = self.embed(event_seqs[:, :-1, 1:])
         else:
             type_feat = self.embed(
-                F.one_hot(event_seqs[:, :-1, 1].long(), self.n_types).float()
+                f.one_hot(event_seqs[:, :-1, 1].long(), self.n_types).float()
             )
-        type_feat = F.pad(type_feat, (0, 0, 1, 0))
+        type_feat = f.pad(type_feat, (0, 0, 1, 0))
 
         feat = torch.cat([temp_feat, type_feat], dim=-1)
         history_emb, *_ = self.seq_encoder(feat)
@@ -183,10 +184,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
         log_basis_weights = self.shallow_net(history_emb).view(
             batch_size, T, self.n_types, -1
         )
+        log_basis_weights = torch.clamp(log_basis_weights, max=30)
         if target_type >= 0:
             log_basis_weights = log_basis_weights[
-                :, :, target_type : target_type + 1
-            ]
+                                :, :, target_type: target_type + 1
+                                ]
 
         # [B, T, 1, R]
         basis_values = torch.cat(
@@ -205,7 +207,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         """
         ts = batch[:, :, 0]
         # (t1 - t0, ..., t_n - t_{n - 1})
-        dt = (ts - F.pad(ts[:, :-1], (1, 0))).unsqueeze(-1)
+        dt = (ts - f.pad(ts[:, :-1], (1, 0))).unsqueeze(-1)
         # [B, T, R]
         integrals = torch.cat(
             [
@@ -218,16 +220,15 @@ class ExplainableRecurrentPointProcess(nn.Module):
         return cumulants
 
     def _eval_nll(
-        self, batch, log_intensities, log_basis_weights, mask, debug=False
+            self, batch, log_intensities, log_basis_weights, mask, debug=False
     ):
 
+        # Probability of the events that actually occurred at t_i+1
         loss_part1 = (
-            -log_intensities.gather(dim=2, index=batch[:, :, 1:].long())
-            .squeeze(-1)
-            .masked_select(mask)
-            .sum()
+            sum([-log_intensities[i][j][k] for i, j, k in torch.nonzero(batch[:, :, 1:])])
         )
 
+        # Probability that no other events occurred between t_i and t_i+1
         loss_part2 = (
             self._eval_cumulants(batch, log_basis_weights)
             .sum(-1)
@@ -242,18 +243,19 @@ class ExplainableRecurrentPointProcess(nn.Module):
         else:
             return (loss_part1 + loss_part2) / batch.size(0)
 
-    def _eval_acc(self, batch, intensities, mask):
+    @staticmethod
+    def _eval_acc(batch, intensities, mask):
         types_pred = intensities.argmax(dim=-1).masked_select(mask)
         types_true = batch[:, :, 1].long().masked_select(mask)
         return (types_pred == types_true).float().mean()
 
     def train_epoch(
-        self,
-        train_dataloader,
-        optim,
-        valid_dataloader=None,
-        device=None,
-        **kwargs,
+            self,
+            train_dataloader,
+            optim,
+            valid_dataloader=None,
+            device=None,
+            **kwargs,
     ):
         self.train()
 
@@ -273,12 +275,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
             )
             if kwargs["l2_reg"] > 0:
                 l2_reg = (
-                    kwargs["l2_reg"]
-                    * log_basis_weights.permute(2, 3, 0, 1)
-                    .masked_select(mask)
-                    .exp()
-                    .pow(2)
-                    .mean()
+                        kwargs["l2_reg"]
+                        * log_basis_weights.permute(2, 3, 0, 1)
+                        .masked_select(mask)
+                        .exp()
+                        .pow(2)
+                        .mean()
                 )
             else:
                 l2_reg = 0.0
@@ -329,89 +331,55 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         return metrics
 
-    def predict_next_event(
-        self, dataloader, predict_type=False, n_samples=100, device=None
-    ):
-        """[summary]
-
-        Args:
-            dataloader (DataLoader):
-            predict_type (bool, optional): Defaults to False.
-            device (optional): Defaults to None.
-
-        Raises:
-            NotImplementedError: if `predict_type = True`.
-
-        Returns:
-            event_seqs_pred (List[List[Union[Tuple, float]]]):
-        """
-
-        basis_max_vals = torch.cat([basis.maximum for basis in self.bases]).to(
-            device
-        )
-
-        event_seqs_pred = []
+    def predict_event_intensities(self, data_loader, days=range(1, 31)):
+        batch_intensities, batch_cumulants, batch_log_basis_weights = [], [], []
         with torch.no_grad():
-            for batch in tqdm(dataloader):
-                batch = batch.to(device)
+            for batch in tqdm(data_loader):
+                batch = batch.to(self.device)
 
                 seq_length = (batch.abs().sum(-1) > 0).sum(-1)
-                mask = generate_sequence_mask(seq_length)
-                N = seq_length.sum()
+                _, log_basis_weights = self.model.forward(batch, need_weights=True)
 
-                _, log_basis_weights = self.forward(batch, need_weights=True)
-                # sum up weights for all event types
-                basis_weights = log_basis_weights.exp().sum(dim=2)
-                # [N, R]
-                basis_weights = basis_weights.masked_select(
-                    mask.unsqueeze(-1)
-                ).view(N, -1)
+                # Get the basis weights for the last event vector in each account [B, K, R]
+                last_log_basis_weights = torch.cat(
+                    [log_basis_weights[i][j-1].unsqueeze(0) for i, j in enumerate(seq_length)])
 
-                t = torch.zeros(N * n_samples, device=device)
-                # the index for unfinished samples
-                idx = torch.arange(N * n_samples, device=device)
-                M = basis_weights[idx // n_samples] @ basis_max_vals
-                while len(idx) > 0:
-                    # get the index for the corresponding basis_weights
-                    idx1 = idx // n_samples
-                    M_idx = M[idx1]
-                    dt = torch.distributions.Exponential(rate=M_idx).sample()
-                    t[idx] += dt
-                    U = torch.rand(len(idx), device=device)
+                dt = torch.tensor([[day] for day in days])
 
-                    basis_values = torch.cat(
-                        [
-                            basis.log_prob(t[idx, None]).exp()
-                            for basis in self.bases
-                        ],
-                        dim=-1,
-                    )
-                    intensity = (basis_weights[idx1] * basis_values).sum(-1)
-                    flag = U < (intensity / M_idx)
-                    idx = idx[~flag]
+                # PDF -> INTENSITIES
+                # Get the probability for day = dt from each basis function [days, R]
+                log_probas = torch.cat([basis.log_prob(dt) for basis in self.model.bases], dim=1)
 
-                t_pred = t.view(-1, n_samples).mean(-1)
-                i = 0
-                for b, L in enumerate(seq_length):
-                    # reconstruct the actually timestamps
-                    seq = t_pred[i : i + L] + F.pad(
-                        batch[b, : L - 1, 0], (1, 0)
-                    )
-                    # TODO: pad the event type as type prediction hasn't been
-                    # implemented yet.
-                    seq = F.pad(seq[:, None], (0, 1)).cpu().numpy()
-                    event_seqs_pred.append(seq)
-                    i += L
+                # Multiply probas by basis weights [B, K, days]
+                intensities = np.exp(last_log_basis_weights.unsqueeze(2) + log_probas).sum(-1)
 
-        return event_seqs_pred
+                # CDF -> CUMULANTS
+                # Integrate each basis function from 0 to t [days, R]
+                integrals = torch.cat([basis.cdf(dt) - basis.cdf(torch.zeros_like(dt))
+                                       for basis in self.model.bases], dim=-1)
+
+                # Multiply integrals by basis weights [B, K, days]
+                cumulants = integrals.mul(last_log_basis_weights.unsqueeze(2).exp()).sum(-1)
+
+                batch_intensities.append(intensities)
+                batch_cumulants.append(cumulants)
+                batch_log_basis_weights.append(last_log_basis_weights)
+
+        # Stack intensities and cumulants [all accounts, K, days]
+        all_intensities = torch.cat(batch_intensities, dim=0)
+        all_cumulants = torch.cat(batch_cumulants, dim=0)
+
+        # Stack basis weights [all accounts, K, R]
+        all_log_basis_weights = torch.cat(batch_log_basis_weights, dim=0)
+
+        return all_intensities, all_cumulants, all_log_basis_weights
 
     def get_infectivity(
-        self,
-        dataloader,
-        device=None,
-        steps=50,
-        occurred_type_only=False,
-        **kwargs,
+            self,
+            dataloader,
+            device=None,
+            steps=50,
+            occurred_type_only=False,
     ):
         def func(X, target_type):
             _, log_basis_weights = self.forward(
@@ -422,7 +390,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             return cumulants[:, 1:]
 
         set_eval_mode(self)
-        # freeze the model parameters to reduce unnecessary backpropogation.
+        # freeze the model parameters to reduce unnecessary backpropagation.
         for param in self.parameters():
             param.requires_grad_(False)
 
@@ -439,11 +407,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
             inputs = torch.cat(
                 [
                     batch[:, :, :1],
-                    F.one_hot(batch[:, :, 1].long(), self.n_types).float(),
+                    f.one_hot(batch[:, :, 1].long(), self.n_types).float(),
                 ],
                 dim=-1,
             )
-            baselines = F.pad(inputs[:, :, :1], (0, self.n_types))
+            baselines = f.pad(inputs[:, :, :1], (0, self.n_types))
             mask = generate_sequence_mask(seq_lengths - 1, device=device)
 
             if occurred_type_only:
@@ -486,7 +454,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             )
             type_counts.scatter_add_(0, index=ks, src=torch.ones_like(ks))
 
-        # plus one to avoid divison by zero
+        # plus one to avoid division by zero
         A /= type_counts[None, :].float() + 1
 
         return A.detach().cpu()
