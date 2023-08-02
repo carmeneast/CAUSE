@@ -36,7 +36,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
         if (n_bases is None or max_mean is None) and basis_means is None:
             raise ValueError('Either (n_bases and max_mean) or basis_means must be specified.')
 
-        self.bases = self.define_basis_functions(basis_type, n_bases=n_bases, max_mean=max_mean,
+        if n_bases is None:
+            n_bases = len(basis_means)
+        self.bases = self.define_basis_functions(basis_type, n_bases, max_mean=max_mean,
                                                  basis_means=basis_means)
 
         self.embedder = nn.Linear(n_types, embedding_dim, bias=False)
@@ -47,13 +49,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
             batch_first=True,
             dropout=dropout,
         )
-        self.decoder = ResidualLayer(hidden_size, n_types * len(self.bases))
+        self.decoder = ResidualLayer(hidden_size, n_types * (n_bases + 1))
 
     @staticmethod
-    def define_basis_functions(basis_type, n_bases=None, max_mean=None, basis_means=None):
+    def define_basis_functions(basis_type, n_bases, max_mean=None, basis_means=None):
         bases = [Unity()]
         if basis_type == 'equal':
-            assert n_bases is not None and max_mean is not None
             loc, scale = [], []
             for i in range(n_bases):
                 loc.append(i * max_mean / (n_bases - 1))
