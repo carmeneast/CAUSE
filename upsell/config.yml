@@ -25,6 +25,7 @@ model:
     - 25
     - 52
   max_log_basis_weight: 30
+  nll_apply_event_weighting: True
 
 train:
   optimizer: 'Adam'

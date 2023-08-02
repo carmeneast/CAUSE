@@ -22,6 +22,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             rnn: str = "GRU",
             dropout: float = 0.0,
             max_log_basis_weight: float = 30.0,
+            nll_apply_event_weighting: bool = True,
             # Basis functions
             basis_type: str = "normal",
             n_bases: int = None,
@@ -31,6 +32,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
     ):
         super().__init__(**kwargs)
         self.n_types = n_types
+        self.nll_apply_event_weighting = nll_apply_event_weighting
         self.max_log_basis_weight = max_log_basis_weight
 
         if (n_bases is None or max_mean is None) and basis_means is None:
@@ -164,13 +166,19 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
     def _eval_nll(self, batch, log_intensities, log_basis_weights, mask, debug=False):
         # Probability of the events that actually occurred at t_i+1
-        loss_part1 = sum([
-            # Multiply the intensity for the account+time+event_type by the weight of the event type
-            #   --> weight could represent the number of times the event occurred, number of keywords, etc.
-            -log_intensities[i][j][k] * batch[i][j][k+1]
-            for i, j, k in
-            torch.nonzero(batch[:, :, 1:])  # list of indices of events that occurred
-        ])
+        if self.nll_apply_event_weighting:
+            loss_part1 = sum([
+                # Multiply the intensity for the account+time+event_type by the weight of the event type
+                #   --> weight could represent the number of times the event occurred, number of keywords, etc.
+                -log_intensities[i][j][k] * batch[i][j][k+1]
+                for i, j, k in
+                torch.nonzero(batch[:, :, 1:])  # list of indices of events that occurred
+            ])
+        else:
+            loss_part1 = sum([
+                -log_intensities[i][j][k] for i, j, k in
+                torch.nonzero(batch[:, :, 1:])  # list of indices of events that occurred
+            ])
 
         # Probability that no other events occurred between t_i and t_i+1
         loss_part2 = (
