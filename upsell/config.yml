@@ -3,7 +3,7 @@ env:
   seed: 42
 
 data_loader:
-  train_validation_split: 8/9
+  train_validation_split: 0.8888888888888888
   bucket_seqs: True
   batch_size: 64
   num_workers: 0

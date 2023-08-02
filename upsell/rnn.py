@@ -84,14 +84,14 @@ class ExplainableRecurrentPointProcess(nn.Module):
     def __init__(
             self,
             n_types: int,
-            max_mean: float,
+            max_mean: float = None,
             embedding_dim: int = 32,
             hidden_size: int = 32,
-            basis_means: list[int] = None,
+            basis_means: list = None,
             basis_type: str = "normal",
             dropout: float = 0.0,
             rnn: str = "GRU",
-            **kwargs,
+            **kwargs
     ):
         super().__init__(**kwargs)
         self.n_types = n_types

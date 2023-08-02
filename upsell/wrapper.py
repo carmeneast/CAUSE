@@ -16,7 +16,7 @@ class CauseWrapper:
         self.tenant_id = tenant_id
         self.bucket = bucket
 
-        self.CONFIG = load_yaml_config('pkg/upsell/config.yml')
+        self.CONFIG = load_yaml_config('upsell/config.yml')
 
         # initialization
         set_rand_seed(self.CONFIG.env.seed, self.CONFIG.env.cuda)
@@ -81,26 +81,26 @@ class CauseWrapper:
         return train_event_seqs, test_event_seqs
 
     def init_data_loaders(self, event_seqs):
-        train_dataloader = DataLoader(
+        train_data_loader = DataLoader(
             EventSeqDataset(event_seqs), **self.data_loader_args
         )
-        train_dataloader, valid_dataloader = split_dataloader(
-            train_dataloader, self.CONFIG.data_loader.train_validation_split
+        train_data_loader, valid_data_loader = split_dataloader(
+            train_data_loader, self.CONFIG.data_loader.train_validation_split
         )
         if self.CONFIG.data_loader.bucket_seqs:
-            train_dataloader = convert_to_bucketed_dataloader(
-                train_dataloader, keys=[x.shape[0] for x in train_dataloader.dataset]
+            train_data_loader = convert_to_bucketed_dataloader(
+                train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset]
             )
-        valid_dataloader = convert_to_bucketed_dataloader(
-            valid_dataloader, keys=[x.shape[0] for x in train_dataloader.dataset], shuffle_same_key=False
+        valid_data_loader = convert_to_bucketed_dataloader(
+            train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset], shuffle_same_key=False
         )
-        return train_dataloader, valid_dataloader
+        return train_data_loader, valid_data_loader
 
     def init_model(self):
         self.model = ExplainableRecurrentPointProcess(n_types=self.n_types, **{**self.CONFIG.model})
         self.model = self.model.to(self.device)
 
-    def train(self, train_dataloader, valid_dataloader):
+    def train(self, train_data_loader, valid_data_loader):
         configs = self.CONFIG.train
         optimizer = getattr(torch.optim, configs.optimizer)(
             self.model.parameters(), lr=configs.lr
@@ -115,9 +115,9 @@ class CauseWrapper:
         train_loss, valid_loss = [], []
         for epoch in range(configs.epochs):
             train_metrics, valid_metrics = self.model.train_epoch(
-                train_dataloader,
+                train_data_loader,
                 optimizer,
-                valid_dataloader,
+                valid_data_loader,
                 device=self.device,
                 **configs,
             )
@@ -159,10 +159,10 @@ class CauseWrapper:
         plt.show()
 
     def eval_nll(self, event_seqs):
-        dataloader = DataLoader(
+        data_loader = DataLoader(
             EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
         )
-        metrics = self.model.evaluate(dataloader, device=self.device)
+        metrics = self.model.evaluate(data_loader, device=self.device)
         msg = '[Test]' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
         nll = metrics['nll'].avg.item()
