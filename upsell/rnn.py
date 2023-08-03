@@ -170,7 +170,8 @@ class ExplainableRecurrentPointProcess(nn.Module):
             loss_part1 = sum([
                 # Multiply the intensity for the account+time+event_type by the weight of the event type
                 #   --> weight could represent the number of times the event occurred, number of keywords, etc.
-                -log_intensities[i][j][k] * batch[i][j][k+1]
+                #   Note: intensity * weight is the same as log_intensity + log_weight
+                -log_intensities[i][j][k] + batch[i][j][k+1].log()
                 for i, j, k in
                 torch.nonzero(batch[:, :, 1:])  # list of indices of events that occurred
             ])
