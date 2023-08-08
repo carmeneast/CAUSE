@@ -28,7 +28,7 @@ class Unity(nn.Module):
     { 0 otherwise
     """
     def __init__(self):
-        super().__init__(self)
+        super().__init__()
         self.maximum = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
 
     @staticmethod
@@ -52,7 +52,7 @@ class Normal(nn.Module, BasisFunction):
 
         self.mu = nn.Parameter(torch.as_tensor(mu).float(), requires_grad=False)
         self.sigma = nn.Parameter(torch.as_tensor(sigma).float(), requires_grad=False)
-        BasisFunction.__init__(self, torch.distributions.Normal(self.loc, self.scale))
+        BasisFunction.__init__(self, torch.distributions.Normal(self.mu, self.sigma))
 
     @property
     def maximum(self):

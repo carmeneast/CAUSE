@@ -43,6 +43,7 @@ class CauseWrapper:
             self.CONFIG.model.precision_at_k.max_k + self.CONFIG.model.precision_at_k.step,
             self.CONFIG.model.precision_at_k.step
         )
+        self.CONFIG.model.__delattr__('precision_at_k')
 
     def run(self):
         # Get event sequences
