@@ -1,4 +1,3 @@
-from collections import defaultdict
 from functools import partial
 import numpy as np
 import torch
@@ -7,9 +6,9 @@ import torch.nn.functional as f
 from tqdm import tqdm
 
 from pkg.explain.integrated_gradient import batch_integrated_gradient
-from pkg.utils.misc import AverageMeter
 from pkg.utils.torch import ResidualLayer, generate_sequence_mask, set_eval_mode
-from pkg.models.func_basis import Normal, Unity
+from upsell.basis_functions import Normal, Unity
+from upsell.metric_tracker import MetricTracker
 
 
 class ExplainableRecurrentPointProcess(nn.Module):
@@ -28,12 +27,20 @@ class ExplainableRecurrentPointProcess(nn.Module):
             n_bases: int = None,
             max_mean: float = None,
             basis_means: list = None,
+            # Metrics
+            ks: list = None,
             **kwargs
     ):
         super().__init__(**kwargs)
         self.n_types = n_types
         self.nll_apply_event_weighting = nll_apply_event_weighting
         self.max_log_basis_weight = max_log_basis_weight
+
+        if ks is None:
+            self.ks = [0.1, 1.0]
+        else:
+            self.ks = ks
+        self.metrics = ['nll'] + [f'precision_at_{k}' for k in self.ks]
 
         if (n_bases is None or max_mean is None) and basis_means is None:
             raise ValueError('Either (n_bases and max_mean) or basis_means must be specified.')
@@ -57,21 +64,21 @@ class ExplainableRecurrentPointProcess(nn.Module):
     def define_basis_functions(basis_type, n_bases, max_mean=None, basis_means=None):
         bases = [Unity()]
         if basis_type == 'equal':
-            loc, scale = [], []
+            mu, sigma = [], []
             for i in range(n_bases):
-                loc.append(i * max_mean / (n_bases - 1))
-                scale.append(max_mean / (n_bases - 1))
+                mu.append(i * max_mean / (n_bases - 1))
+                sigma.append(max_mean / (n_bases - 1))
         elif basis_type == 'dyadic':
             if basis_means is not None:
-                loc = sorted(basis_means)
-                scale = [loc[1] / (2 * 3)] + [mu / 3 for mu in loc[1:]]
+                mu = sorted(basis_means)
+                sigma = [mu[1] / (2 * 3)] + [mu / 3 for mu in mu[1:]]
             else:
-                loc = [0] + sorted([max_mean / 2 ** i for i in range(n_bases-1)])
-                scale = [max_mean / 2 ** (n_bases-1) / 3] + [mu / 3 for mu in loc[1:]]
+                mu = [0] + sorted([max_mean / 2 ** i for i in range(n_bases-1)])
+                sigma = [max_mean / 2 ** (n_bases-1) / 3] + [mu / 3 for mu in mu[1:]]
         else:
             raise ValueError(f'Unrecognized basis_type={basis_type}')
 
-        bases.append(Normal(loc=loc, scale=scale))
+        bases.append(Normal(mu=mu, sigma=sigma))
         return nn.ModuleList(bases)
 
     def forward(self, event_seqs, onehot=True, need_weights=True, target_type=-1):
@@ -135,11 +142,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
                                 ]
 
         # [B, T, 1, R]
-        basis_values = torch.cat(
+        log_basis_probas = torch.cat(
             [basis.log_prob(dt[:, 1:, None]) for basis in self.bases], dim=2
         ).unsqueeze(-2)
 
-        log_intensities = (log_basis_weights + basis_values).logsumexp(dim=-1)
+        log_intensities = (log_basis_weights + log_basis_probas).logsumexp(dim=-1)
 
         if need_weights:
             return log_intensities, log_basis_weights
@@ -197,10 +204,15 @@ class ExplainableRecurrentPointProcess(nn.Module):
         return (loss_part1 + loss_part2) / batch.size(0)
 
     @staticmethod
-    def _eval_acc(batch, intensities, mask):
-        types_pred = intensities.argmax(dim=-1).masked_select(mask)
-        types_true = batch[:, :, 1].long().masked_select(mask)
-        return (types_pred == types_true).float().mean()
+    def _eval_precision_at_k(batch, log_intensities, k=1.0):
+        # Select events with intensity >= k
+        mask = log_intensities >= np.log(k)
+        high_intensity_events = batch[:, :, 1:].masked_select(mask)
+
+        # Check which events actually occurred (ignoring event weights)
+        precision = (high_intensity_events > 0).float().mean()
+        n = len(high_intensity_events)
+        return precision, n
 
     def train_epoch(
             self,
@@ -212,7 +224,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
     ):
         self.train()
 
-        train_metrics = defaultdict(AverageMeter)
+        train_metrics = {m: MetricTracker(metric=m) for m in ['loss', 'l2_reg'] + self.metrics}
 
         for batch in train_dataloader:
             if device:
@@ -243,12 +255,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
             loss.backward()
             optim.step()
 
-            train_metrics["loss"].update(loss, batch.size(0))
-            train_metrics["nll"].update(nll, batch.size(0))
-            train_metrics["l2_reg"].update(l2_reg, seq_length.sum())
-            train_metrics["acc"].update(
-                self._eval_acc(batch, log_intensities, mask), seq_length.sum()
-            )
+            train_metrics['loss'].update(loss, batch.size(0))
+            train_metrics['nll'].update(nll, batch.size(0))
+            train_metrics['l2_reg'].update(l2_reg, seq_length.sum())
+            for k in self.ks:
+                p, n = self._eval_precision_at_k(batch, log_intensities, k)
+                train_metrics[f'precision_at_{k}'].update(p, n)
 
         if valid_dataloader:
             valid_metrics = self.evaluate(valid_dataloader, device=device)
@@ -258,7 +270,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         return train_metrics, valid_metrics
 
     def evaluate(self, dataloader, device=None):
-        metrics = defaultdict(AverageMeter)
+        metrics = {m: MetricTracker(metric=m) for m in self.metrics}
 
         self.eval()
         with torch.no_grad():
@@ -276,11 +288,10 @@ class ExplainableRecurrentPointProcess(nn.Module):
                     batch, log_intensities, log_basis_weights, mask
                 )
 
-                metrics["nll"].update(nll, batch.size(0))
-                metrics["acc"].update(
-                    self._eval_acc(batch, log_intensities, mask),
-                    seq_length.sum(),
-                )
+                metrics['nll'].update(nll, batch.size(0))
+                for k in self.ks:
+                    p, n = self._eval_precision_at_k(batch, log_intensities, k)
+                    metrics[f'precision_at_{k}'].update(p, n)
 
         return metrics
 

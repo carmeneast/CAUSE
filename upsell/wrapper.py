@@ -7,6 +7,7 @@ from pkg.utils.misc import get_freer_gpu, set_rand_seed
 from pkg.utils.torch import split_dataloader, convert_to_bucketed_dataloader
 from upsell.configs import load_yaml_config
 from upsell.event_seq_dataset import EventSeqDataset
+from upsell.metric_tracker import MetricTracker
 from upsell.rnn import ExplainableRecurrentPointProcess
 from upsell.s3 import load_numpy_data, load_pytorch_object, save_pytorch_dataset, save_pytorch_model
 
@@ -36,6 +37,13 @@ class CauseWrapper:
             'num_workers': self.CONFIG.data_loader.num_workers,
         }
 
+        # Initialize ks for precision calculation
+        self.CONFIG.model.ks = np.arange(
+            self.CONFIG.model.precision_at_k.min_k,
+            self.CONFIG.model.precision_at_k.max_k + self.CONFIG.model.precision_at_k.step,
+            self.CONFIG.model.precision_at_k.step
+        )
+
     def run(self):
         # Get event sequences
         train_event_seqs, test_event_seqs = self.load_event_seqs()
@@ -47,8 +55,10 @@ class CauseWrapper:
         self.plot_training_loss(history, self.CONFIG.train.tune_metric)
 
         # Evaluates model on test set
-        nll = self.eval_nll(test_event_seqs)
-        print(f'NLL: {nll}')
+        metrics = self.calculate_test_metrics(test_event_seqs)
+        for k, v in metrics.items():
+            print(f'{k}: {v.avg.item()}')
+        self.plot_precision_at_k(metrics)
 
         # Predicts future event intensities on test set
         days = range(self.CONFIG.predict.min_days, self.CONFIG.predict.max_days + 1)
@@ -113,7 +123,7 @@ class CauseWrapper:
         best_metric = float('inf')
         best_epoch = 0
 
-        train_loss, valid_loss = [], []
+        loss = {loss_type: MetricTracker(metric=loss_type) for loss_type in ['train', 'valid']}
         for epoch in range(configs.epochs):
             train_metrics, valid_metrics = self.model.train_epoch(
                 train_data_loader,
@@ -122,8 +132,8 @@ class CauseWrapper:
                 device=self.device,
                 **configs,
             )
-            train_loss.append(train_metrics['nll'].avg)
-            valid_loss.append(valid_metrics['nll'].avg)
+            loss['train'].update(train_metrics['nll'].avg, n=train_metrics['nll'].count)
+            loss['valid'].update(valid_metrics['nll'].avg, n=valid_metrics['nll'].count)
 
             msg = f'[Training] Epoch={epoch}'
             for k, v in train_metrics.items():
@@ -146,7 +156,11 @@ class CauseWrapper:
 
         # Reset model to the last-saved (best) version of the model
         self.model = load_pytorch_object(self.bucket, self.tenant_id, 'model')
-        history = pd.DataFrame({'epoch': range(epoch + 1), 'train': train_loss, 'valid': valid_loss})
+        history = pd.DataFrame({
+            'epoch': range(epoch + 1),
+            'train': loss['train'].values,
+            'valid': loss['valid'].values,
+        })
         return history
 
     @staticmethod
@@ -159,15 +173,22 @@ class CauseWrapper:
         plt.legend()
         plt.show()
 
-    def eval_nll(self, event_seqs):
+    def plot_precision_at_k(self, metrics):
+        ks = self.CONFIG.model.ks
+        precisions = [metrics[f'precision_at_{k}'].avg for k in ks]
+        plt.plot(ks, precisions)
+        plt.xlabel('Intensity')
+        plt.ylabel('Precision @ Intensity')
+        plt.show()
+
+    def calculate_test_metrics(self, event_seqs):
         data_loader = DataLoader(
             EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
         )
         metrics = self.model.evaluate(data_loader, device=self.device)
         msg = '[Test]' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
-        nll = metrics['nll'].avg.item()
-        return nll
+        return metrics
 
     def predict(self, event_seqs, days=range(1, 31)):
         data_loader = DataLoader(

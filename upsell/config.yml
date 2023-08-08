@@ -26,6 +26,10 @@ model:
     - 52
   max_log_basis_weight: 10
   nll_apply_event_weighting: True
+  precision_at_k:
+    min_k: 0.0
+    max_k: 3.0
+    step: 0.01
 
 train:
   optimizer: 'Adam'
