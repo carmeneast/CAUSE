@@ -37,14 +37,6 @@ class CauseWrapper:
             'num_workers': self.CONFIG.data_loader.num_workers,
         }
 
-        # Initialize ks for precision calculation
-        self.CONFIG.model.ks = np.arange(
-            self.CONFIG.model.precision_at_k.min_k,
-            self.CONFIG.model.precision_at_k.max_k + self.CONFIG.model.precision_at_k.step,
-            self.CONFIG.model.precision_at_k.step
-        )
-        self.CONFIG.model.__delattr__('precision_at_k')
-
     def run(self):
         # Get event sequences
         train_event_seqs, test_event_seqs = self.load_event_seqs()
@@ -57,8 +49,6 @@ class CauseWrapper:
 
         # Evaluates model on test set
         metrics = self.calculate_test_metrics(test_event_seqs)
-        for k, v in metrics.items():
-            print(f'{k}: {v.avg.item()}')
         self.plot_precision_at_k(metrics)
 
         # Predicts future event intensities on test set
@@ -187,7 +177,7 @@ class CauseWrapper:
             EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
         )
         metrics = self.model.evaluate(data_loader, device=self.device)
-        msg = '[Test]' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
+        msg = '[Test] ' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
         return metrics
 
