@@ -1,14 +1,31 @@
 from functools import partial
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as f
 from tqdm import tqdm
 
-from pkg.explain.integrated_gradient import batch_integrated_gradient
-from pkg.utils.torch import ResidualLayer, generate_sequence_mask, set_eval_mode
+from upsell.utils import batch_integrated_gradient, generate_sequence_mask, set_eval_mode
 from upsell.basis_functions import Normal, Unity
 from upsell.metric_tracker import MetricTracker
+
+
+class Decoder(nn.Module):
+    def __init__(self, in_features, out_features, hidden_size=0, activation=None):
+        super().__init__()
+        hidden_size = hidden_size or in_features
+        self.net1 = nn.Sequential(
+            nn.Linear(in_features, hidden_size),
+            activation or nn.ReLU(),
+            nn.Linear(hidden_size, out_features),
+        )
+        if hidden_size == out_features:
+            self.net2 = lambda x: x
+        else:
+            self.net2 = nn.Linear(in_features, out_features, bias=False)
+
+    def forward(self, x):
+        return self.net1(x) + self.net2(x)
 
 
 class ExplainableRecurrentPointProcess(nn.Module):
@@ -58,7 +75,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             batch_first=True,
             dropout=dropout,
         )
-        self.decoder = ResidualLayer(hidden_size, n_types * (n_bases + 1))
+        self.decoder = Decoder(hidden_size, n_types * (n_bases + 1))
 
     @staticmethod
     def define_basis_functions(basis_type, n_bases, max_mean=None, basis_means=None):
