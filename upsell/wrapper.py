@@ -1,7 +1,8 @@
+import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import torch
+from datetime import datetime
 from torch.utils.data import DataLoader
 
 from upsell.configs import load_yaml_config
@@ -116,8 +117,14 @@ class CauseWrapper:
         best_metric = float('inf')
         best_epoch = 0
 
-        loss = {loss_type: MetricTracker(metric=loss_type) for loss_type in ['train', 'valid']}
+        epoch_metrics = {
+            loss_type: {metric: MetricTracker(metric=metric) for metric in configs.metrics}
+            for loss_type in ['train', 'valid']
+        }
+        dt = []
         for epoch in range(configs.epochs):
+            start = datetime.now()
+            print(f'Epoch {epoch}: {start}')
             train_metrics, valid_metrics = self.model.train_epoch(
                 train_data_loader,
                 optimizer,
@@ -125,16 +132,19 @@ class CauseWrapper:
                 device=self.device,
                 **configs,
             )
-            loss['train'].update(train_metrics['nll'].avg, n=train_metrics['nll'].count)
-            loss['valid'].update(valid_metrics['nll'].avg, n=valid_metrics['nll'].count)
+            # Store training and validation metrics for this epoch
+            for loss_type in ['train', 'valid']:
+                for metric in configs.metrics:
+                    epoch_metrics[loss_type][metric].update(
+                        eval(f'{loss_type}_metrics')[metric].avg,
+                        n=eval(f'{loss_type}_metrics')[metric].count,
+                    )
+            end = datetime.now()
+            dt.append((end - start).total_seconds())
 
-            msg = f'[Training] Epoch={epoch}'
-            for k, v in train_metrics.items():
-                msg += f', {k}={v.avg:.4f}'
+            msg = f'[Training] Epoch={epoch} {configs.tune_metric}={train_metrics[configs.tune_metrics].avg:.4f}'
             print(msg)  # logger.info(msg)
-            msg = f'[Validation] Epoch={epoch}'
-            for k, v in valid_metrics.items():
-                msg += f', {k}={v.avg:.4f}'
+            msg = f'[Validation] Epoch={epoch} {configs.tune_metric}={valid_metrics[configs.tune_metrics].avg:.4f}'
             print(msg)  # logger.info(msg)
 
             if valid_metrics[configs.tune_metric].avg < best_metric:
@@ -149,16 +159,21 @@ class CauseWrapper:
 
         # Reset model to the last-saved (best) version of the model
         self.model = load_pytorch_object(self.bucket, self.tenant_id, self.run_date, self.sampling, 'model')
+
+        # Save training history
         history = pd.DataFrame({
             'epoch': range(epoch + 1),
-            'train': loss['train'].values,
-            'valid': loss['valid'].values,
+            'dt': dt,
         })
+        for loss_type in ['train', 'valid']:
+            for metric in configs.metrics:
+                history[f'{loss_type}_{metric}'] = epoch_metrics[loss_type][metric].values
+        history.to_csv(f'{self.tenant_id}/{self.run_date}/{self.sampling}/history.csv', index=False)
         return history
 
     def plot_training_loss(self, history, tune_metric):
-        plt.plot(history['train'], label='train')
-        plt.plot(history['valid'], label='valid')
+        plt.plot(history[f'train_{tune_metric}'], label='train')
+        plt.plot(history[f'valid_{tune_metric}'], label='valid')
         plt.xlabel('epoch')
         plt.ylabel(tune_metric)
         plt.yscale('log')
@@ -182,8 +197,8 @@ class CauseWrapper:
         metrics = self.model.evaluate(data_loader, device=self.device)
         msg = '[Test] ' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
-        d = {k: v.avg for k, v in metrics.items()}
-        pd.DataFrame.from_dict(d, orient='index').to_json(f'{self.tenant_id}/{self.run_date}/{self.sampling}/test_metrics.json')
+        pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
+            .to_json(f'{self.tenant_id}/{self.run_date}/{self.sampling}/test_metrics.json')
         return metrics
 
     def predict(self, event_seqs, days=range(1, 31)):

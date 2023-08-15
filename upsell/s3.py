@@ -52,7 +52,7 @@ def load_numpy_data(bucket, tenant_id, run_date, sampling):
         data = np.load(obj, allow_pickle=True)
 
         event_seqs = data['event_seqs']
-        print('event_seqs', len(event_seqs))
+        print('event_seqs', len(event_seqs), event_seqs[0].shape[1])
         train_test_splits = data['train_test_splits']
         print('train_test_splits', len(train_test_splits))
         account_ids = data['account_ids']

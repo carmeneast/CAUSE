@@ -330,7 +330,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
                 # PDF -> INTENSITIES
                 # Get the probability for day = dt from each basis function [days, R]
-                log_probas = torch.cat([basis.log_prob(dt) for basis in self.bases], dim=1)
+                log_probas = torch.cat([basis.log_prob(dt).type(torch.float32) for basis in self.bases], dim=1)
 
                 # Multiply probas by basis weights [B, K, days]
                 intensities = np.exp(last_log_basis_weights.unsqueeze(2) + log_probas).sum(-1)
