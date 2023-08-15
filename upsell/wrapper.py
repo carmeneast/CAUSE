@@ -142,9 +142,9 @@ class CauseWrapper:
             end = datetime.now()
             dt.append((end - start).total_seconds())
 
-            msg = f'[Training] Epoch={epoch} {configs.tune_metric}={train_metrics[configs.tune_metrics].avg:.4f}'
+            msg = f'[Training] Epoch={epoch} {configs.tune_metric}={train_metrics[configs.tune_metric].avg:.4f}'
             print(msg)  # logger.info(msg)
-            msg = f'[Validation] Epoch={epoch} {configs.tune_metric}={valid_metrics[configs.tune_metrics].avg:.4f}'
+            msg = f'[Validation] Epoch={epoch} {configs.tune_metric}={valid_metrics[configs.tune_metric].avg:.4f}'
             print(msg)  # logger.info(msg)
 
             if valid_metrics[configs.tune_metric].avg < best_metric:
