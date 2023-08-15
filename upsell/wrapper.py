@@ -118,7 +118,7 @@ class CauseWrapper:
         best_epoch = 0
 
         epoch_metrics = {
-            loss_type: {metric: MetricTracker(metric=metric) for metric in configs.metrics}
+            loss_type: {metric: MetricTracker(metric=metric) for metric in self.model.metrics}
             for loss_type in ['train', 'valid']
         }
         dt = []
@@ -134,7 +134,7 @@ class CauseWrapper:
             )
             # Store training and validation metrics for this epoch
             for loss_type in ['train', 'valid']:
-                for metric in configs.metrics:
+                for metric in self.model.metrics:
                     epoch_metrics[loss_type][metric].update(
                         eval(f'{loss_type}_metrics')[metric].avg,
                         n=eval(f'{loss_type}_metrics')[metric].count,
@@ -166,7 +166,7 @@ class CauseWrapper:
             'dt': dt,
         })
         for loss_type in ['train', 'valid']:
-            for metric in configs.metrics:
+            for metric in self.model.metrics:
                 history[f'{loss_type}_{metric}'] = epoch_metrics[loss_type][metric].values
         history.to_csv(f'{self.tenant_id}/{self.run_date}/{self.sampling}/history.csv', index=False)
         return history
