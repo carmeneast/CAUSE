@@ -40,9 +40,14 @@ def pd_read_s3_multiple_files(bucket, key, file_suffix='.csv', verbose=False):
     return final
 
 
-def load_numpy_data(bucket, tenant_id):
+def s3_key(tenant_id, run_date, sampling):
+    return f'upsell/{tenant_id}/{run_date}/{sampling}/'
+
+
+def load_numpy_data(bucket, tenant_id, run_date, sampling):
+    key = s3_key(tenant_id, run_date, sampling)
     with BytesIO() as obj:
-        boto3.resource('s3').Bucket(bucket).download_fileobj(f'upsell/{tenant_id}/model_data.npz', obj)
+        boto3.resource('s3').Bucket(bucket).download_fileobj(key+'model_data.npz', obj)
         obj.seek(0)
         data = np.load(obj, allow_pickle=True)
 
@@ -53,7 +58,7 @@ def load_numpy_data(bucket, tenant_id):
         account_ids = data['account_ids']
         print('account_ids', account_ids.shape)
 
-    event_type_names = pd_read_s3_multiple_files(bucket, f'upsell/{tenant_id}/eventTypeNames', '.csv')
+    event_type_names = pd_read_s3_multiple_files(bucket, key+'eventTypeNames', '.csv')
     n_types = len(event_type_names)
     print('n_types', n_types)
     return {
@@ -65,24 +70,27 @@ def load_numpy_data(bucket, tenant_id):
     }
 
 
-def save_pytorch_dataset(dataset, bucket, tenant_id, name):
+def save_pytorch_dataset(dataset, bucket, tenant_id, run_date, sampling, name):
+    key = s3_key(tenant_id, run_date, sampling)
     s3 = boto3.client('s3')
     buffer = BytesIO()
     torch.save(dataset.cpu().numpy(), buffer, pickle_protocol=4)
-    s3.put_object(Bucket=bucket, Key=f'upsell/{tenant_id}/{name}.pt', Body=buffer.getvalue())
+    s3.put_object(Bucket=bucket, Key=key+name+'.pt', Body=buffer.getvalue())
 
 
-def save_pytorch_model(model, bucket, tenant_id):
+def save_pytorch_model(model, bucket, tenant_id, run_date, sampling):
+    key = s3_key(tenant_id, run_date, sampling)
     s3 = boto3.client('s3')
     buffer = BytesIO()
     torch.save(model, buffer)
-    s3.put_object(Bucket=bucket, Key=f'upsell/{tenant_id}/model.pt', Body=buffer.getvalue())
+    s3.put_object(Bucket=bucket, Key=key+'model.pt', Body=buffer.getvalue())
 
 
-def load_pytorch_object(bucket, tenant_id, name):
+def load_pytorch_object(bucket, tenant_id, run_date, sampling, name):
+    key = s3_key(tenant_id, run_date, sampling)
     s3 = boto3.resource('s3')
     with BytesIO() as data:
-        s3.Bucket(bucket).download_fileobj(f'upsell/{tenant_id}/{name}.pt', data)
+        s3.Bucket(bucket).download_fileobj(key+name+'.pt', data)
         data.seek(0)
         obj = torch.load(data)
     return obj

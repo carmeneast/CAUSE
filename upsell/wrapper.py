@@ -14,8 +14,10 @@ from upsell.utils import convert_to_bucketed_dataloader, get_freer_gpu, set_rand
 
 class CauseWrapper:
 
-    def __init__(self, tenant_id, bucket='ceasterwood'):
+    def __init__(self, tenant_id, run_date, sampling=None, bucket='ceasterwood'):
         self.tenant_id = tenant_id
+        self.run_date = run_date
+        self.sampling = sampling
         self.bucket = bucket
 
         self.CONFIG = load_yaml_config('upsell/config.yml')
@@ -67,7 +69,7 @@ class CauseWrapper:
         return device
 
     def load_event_seqs(self):
-        data = load_numpy_data(self.bucket, self.tenant_id)
+        data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling)
         self.n_types = data['n_types']
         self.event_type_names = data['event_type_names']
         self.account_ids = data['account_ids']
@@ -138,7 +140,7 @@ class CauseWrapper:
             if valid_metrics[configs.tune_metric].avg < best_metric:
                 best_epoch = epoch
                 best_metric = valid_metrics[configs.tune_metric].avg
-                save_pytorch_model(self.model, self.bucket, self.tenant_id)
+                save_pytorch_model(self.model, self.bucket, self.tenant_id, self.run_date, self.sampling)
 
             if epoch - best_epoch >= configs.patience:
                 print(f'Stopped training early at epoch {epoch}: ' +
@@ -146,7 +148,7 @@ class CauseWrapper:
                 break
 
         # Reset model to the last-saved (best) version of the model
-        self.model = load_pytorch_object(self.bucket, self.tenant_id, 'model')
+        self.model = load_pytorch_object(self.bucket, self.tenant_id, self.run_date, self.sampling, 'model')
         history = pd.DataFrame({
             'epoch': range(epoch + 1),
             'train': loss['train'].values,
@@ -154,14 +156,14 @@ class CauseWrapper:
         })
         return history
 
-    @staticmethod
-    def plot_training_loss(history, tune_metric):
+    def plot_training_loss(self, history, tune_metric):
         plt.plot(history['train'], label='train')
         plt.plot(history['valid'], label='valid')
         plt.xlabel('epoch')
         plt.ylabel(tune_metric)
         plt.yscale('log')
         plt.legend()
+        plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/training_loss.png')
         plt.show()
 
     def plot_precision_at_k(self, metrics):
@@ -170,6 +172,7 @@ class CauseWrapper:
         plt.plot(ks, precisions)
         plt.xlabel('Intensity')
         plt.ylabel('Precision @ Intensity')
+        plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/precision_at_k.png')
         plt.show()
 
     def calculate_test_metrics(self, event_seqs):
@@ -179,6 +182,8 @@ class CauseWrapper:
         metrics = self.model.evaluate(data_loader, device=self.device)
         msg = '[Test] ' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
+        d = {k: v.avg for k, v in metrics.items()}
+        pd.DataFrame.from_dict(d, orient='index').to_json(f'{self.tenant_id}/{self.run_date}/{self.sampling}/test_metrics.json')
         return metrics
 
     def predict(self, event_seqs, days=range(1, 31)):
@@ -187,9 +192,9 @@ class CauseWrapper:
         )
         intensities, cumulants, log_basis_weights = self.model.predict_event_intensities(data_loader, self.device, days)
 
-        save_pytorch_dataset(intensities, self.bucket, self.tenant_id, 'event_intensities')
-        save_pytorch_dataset(cumulants, self.bucket, self.tenant_id, 'event_cumulants')
-        save_pytorch_dataset(log_basis_weights, self.bucket, self.tenant_id, 'log_basis_weights')
+        for dataset, name in [(intensities, 'event_intensities'), (cumulants, 'event_cumulants'),
+                              (log_basis_weights, 'log_basis_weights')]:
+            save_pytorch_dataset(dataset, self.bucket, self.tenant_id, self.run_date, self.sampling, name)
 
         return intensities, cumulants, log_basis_weights
 
