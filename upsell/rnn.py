@@ -52,13 +52,6 @@ class ExplainableRecurrentPointProcess(nn.Module):
         super().__init__(**kwargs)
         self.n_event_types = n_event_types
 
-        # Neural networks
-        # TODO: move clamping into model
-        self.max_log_basis_weight = max_log_basis_weight
-        self.embedder, self.encoder, self.dropout, self.decoder = self.define_model(
-            embedding_dim, hidden_size, rnn, dropout, n_bases
-        )
-
         # Basis functions
         if (n_bases is None or max_mean is None) and basis_means is None:
             raise ValueError('Either (n_bases and max_mean) or basis_means must be specified.')
@@ -67,6 +60,13 @@ class ExplainableRecurrentPointProcess(nn.Module):
             n_bases = len(basis_means)
         self.bases = self.define_basis_functions(basis_type, n_bases, max_mean=max_mean,
                                                  basis_means=basis_means)
+
+        # Neural networks
+        # TODO: move clamping into model
+        self.max_log_basis_weight = max_log_basis_weight
+        self.embedder, self.encoder, self.dropout, self.decoder = self.define_model(
+            embedding_dim, hidden_size, rnn, dropout, n_bases
+        )
 
         # Metrics
         if ks is None:
