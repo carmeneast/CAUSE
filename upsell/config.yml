@@ -25,7 +25,6 @@ model:
     - 25
     - 52
   max_log_basis_weight: 10
-  nll_apply_event_weighting: True
   ks:
     - 0.0
     - 0.01
@@ -43,8 +42,8 @@ train:
   attr_batch_size: 8
   occurred_type_only: True
   tune_metric: 'nll'
-  patience: 2
+  patience: 3
 
 predict:
-  min_days: 1
-  max_days: 30
+  min_time_steps: 1
+  max_time_steps: 5

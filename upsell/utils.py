@@ -36,7 +36,7 @@ def generate_sequence_mask(lengths, device=None):
     return index.unsqueeze(0) < lengths.unsqueeze(1)
 
 
-def split_dataloader(data_loader: DataLoader, ratio: float):
+def split_data_loader(data_loader: DataLoader, ratio: float):
     """
     Split a data loader into two data loaders, each with a portion of the dataset in the original
     data loader. Useful for splitting into train and validation data loaders.
@@ -116,7 +116,7 @@ class KeyBucketedBatchSampler(torch.utils.data.Sampler):
             return (len(self.keys) + self.batch_size - 1) // self.batch_size
 
 
-def convert_to_bucketed_dataloader(data_loader: DataLoader, key_fn: Optional[Callable] = None,
+def convert_to_bucketed_data_loader(data_loader: DataLoader, key_fn: Optional[Callable] = None,
                                    keys: Optional[List] = None, shuffle_same_key: bool = True):
     """
     Convert a data loader to bucketed data loader with a given keys.

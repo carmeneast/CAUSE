@@ -10,7 +10,7 @@ from upsell.event_seq_dataset import EventSeqDataset
 from upsell.metric_tracker import MetricTracker
 from upsell.rnn import ExplainableRecurrentPointProcess
 from upsell.s3 import load_numpy_data, load_pytorch_object, save_pytorch_dataset, save_pytorch_model
-from upsell.utils import convert_to_bucketed_dataloader, get_freer_gpu, set_rand_seed, split_dataloader
+from upsell.utils import convert_to_bucketed_data_loader, get_freer_gpu, set_rand_seed, split_data_loader
 
 
 class CauseWrapper:
@@ -30,7 +30,7 @@ class CauseWrapper:
         # logger = get_logger(__file__)
 
         # initialize model artifacts
-        self.n_types, self.event_type_names = None, None
+        self.n_event_types, self.event_type_names = None, None
         self.model = None
         self.account_ids = None
 
@@ -45,18 +45,18 @@ class CauseWrapper:
         train_event_seqs, test_event_seqs = self.load_event_seqs()
         train_data_loader, valid_data_loader = self.init_data_loaders(train_event_seqs)
 
-        # Trains model
+        # Train model
         self.init_model()
         history = self.train(train_data_loader, valid_data_loader)
         self.plot_training_loss(history, self.CONFIG.train.tune_metric)
 
-        # Evaluates model on test set
+        # Evaluate model on test set
         metrics = self.calculate_test_metrics(test_event_seqs)
         self.plot_precision_at_k(metrics)
 
-        # Predicts future event intensities on test set
-        days = range(self.CONFIG.predict.min_days, self.CONFIG.predict.max_days + 1)
-        intensities, cumulants, log_basis_weights = self.predict(test_event_seqs, days=days)
+        # Predict future event intensities on test set
+        time_steps = range(self.CONFIG.predict.min_time_steps, self.CONFIG.predict.max_time_steps + 1)
+        intensities, cumulants, log_basis_weights = self.predict(test_event_seqs, time_steps=time_steps)
         print(intensities.shape, cumulants.shape, log_basis_weights.shape)
 
     def get_device(self, dynamic=False):
@@ -71,7 +71,7 @@ class CauseWrapper:
 
     def load_event_seqs(self):
         data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling)
-        self.n_types = data['n_types']
+        self.n_event_types = data['n_event_types']
         self.event_type_names = data['event_type_names']
         self.account_ids = data['account_ids']
         event_seqs = data['event_seqs']
@@ -90,20 +90,20 @@ class CauseWrapper:
         train_data_loader = DataLoader(
             EventSeqDataset(event_seqs), **self.data_loader_args
         )
-        train_data_loader, valid_data_loader = split_dataloader(
+        train_data_loader, valid_data_loader = split_data_loader(
             train_data_loader, self.CONFIG.data_loader.train_validation_split
         )
         if self.CONFIG.data_loader.bucket_seqs:
-            train_data_loader = convert_to_bucketed_dataloader(
+            train_data_loader = convert_to_bucketed_data_loader(
                 train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset]
             )
-        valid_data_loader = convert_to_bucketed_dataloader(
+        valid_data_loader = convert_to_bucketed_data_loader(
             valid_data_loader, keys=[x.shape[0] for x in valid_data_loader.dataset], shuffle_same_key=False
         )
         return train_data_loader, valid_data_loader
 
     def init_model(self):
-        self.model = ExplainableRecurrentPointProcess(n_types=self.n_types, **{**self.CONFIG.model})
+        self.model = ExplainableRecurrentPointProcess(n_event_types=self.n_event_types, **{**self.CONFIG.model})
         self.model = self.model.to(self.device)
 
     def train(self, train_data_loader, valid_data_loader):
@@ -136,7 +136,7 @@ class CauseWrapper:
             for loss_type in ['train', 'valid']:
                 for metric in self.model.metrics:
                     epoch_metrics[loss_type][metric].update(
-                        eval(f'{loss_type}_metrics')[metric].avg,
+                        eval(f'{loss_type}_metrics')[metric].avg.item(),
                         n=eval(f'{loss_type}_metrics')[metric].count,
                     )
             end = datetime.now()
@@ -201,11 +201,12 @@ class CauseWrapper:
             .to_json(f'{self.tenant_id}/{self.run_date}/{self.sampling}/test_metrics.json')
         return metrics
 
-    def predict(self, event_seqs, days=range(1, 31)):
+    def predict(self, event_seqs, time_steps=range(1, 5)):
         data_loader = DataLoader(
             EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
         )
-        intensities, cumulants, log_basis_weights = self.model.predict_event_intensities(data_loader, self.device, days)
+        intensities, cumulants, log_basis_weights = \
+            self.model.predict_future_event_intensities(data_loader, self.device, time_steps)
 
         for dataset, name in [(intensities, 'event_intensities'), (cumulants, 'event_cumulants'),
                               (log_basis_weights, 'log_basis_weights')]:
