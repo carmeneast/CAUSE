@@ -176,7 +176,6 @@ class CauseWrapper:
         plt.plot(history[f'valid_{tune_metric}'], label='valid')
         plt.xlabel('epoch')
         plt.ylabel(tune_metric)
-        plt.yscale('log')
         plt.legend()
         plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/training_loss.png')
         plt.show()
