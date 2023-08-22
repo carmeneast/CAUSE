@@ -44,19 +44,23 @@ def s3_key(tenant_id, run_date, sampling):
     return f'upsell/{tenant_id}/{run_date}/{sampling}/'
 
 
-def load_numpy_data(bucket, tenant_id, run_date, sampling):
+def load_numpy_data(bucket, tenant_id, run_date, sampling, training=True):
     key = s3_key(tenant_id, run_date, sampling)
+    filename = 'model_train_data.npz' if training else 'model_pred_data.npz'
     with BytesIO() as obj:
-        boto3.resource('s3').Bucket(bucket).download_fileobj(key+'model_data.npz', obj)
+        boto3.resource('s3').Bucket(bucket).download_fileobj(key+filename, obj)
         obj.seek(0)
         data = np.load(obj, allow_pickle=True)
 
         event_seqs = data['event_seqs']
         print('event_seqs', len(event_seqs), event_seqs[0].shape[1])
-        train_test_splits = data['train_test_splits']
-        print('train_test_splits', len(train_test_splits))
         account_ids = data['account_ids']
         print('account_ids', account_ids.shape)
+        if training:
+            train_test_splits = data['train_test_splits']
+            print('train_test_splits', len(train_test_splits))
+        else:
+            train_test_splits = None
 
     event_type_names = pd_read_s3_multiple_files(bucket, key+'eventTypeNames', '.csv')
     n_event_types = len(event_type_names)

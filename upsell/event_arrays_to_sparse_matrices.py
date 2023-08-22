@@ -25,9 +25,10 @@ def convert_to_series_of_sparse_matrices(event_df):
     return events_by_account[['tenant_id', 'account_id']], event_seqs
 
 
-def create_save_event_seqs(bucket, tenant_id, run_date, sampling, n_splits=5, random_state=16):
+def create_save_event_seqs(bucket, tenant_id, run_date, sampling, n_splits=5, random_state=16, training=False):
     key = s3_key(tenant_id, run_date, sampling)
-    events = pd_read_s3_multiple_files(bucket, key+'sparseEventVectors/', '.parquet')
+    path = 'sparseEventVectors/' if training else 'predSparseEventVectors/'
+    events = pd_read_s3_multiple_files(bucket, key+path, '.parquet')
     print('events', events.shape)
 
     accounts, event_seqs = convert_to_series_of_sparse_matrices(events)
@@ -41,6 +42,7 @@ def create_save_event_seqs(bucket, tenant_id, run_date, sampling, n_splits=5, ra
     )
     print('train_test_splits', len(train_test_splits))
 
+    filename = 'model_train_data.npz' if training else 'model_pred_data.npz'
     with tempfile.TemporaryFile() as outfile:
         np.savez(
             outfile,
@@ -51,6 +53,6 @@ def create_save_event_seqs(bucket, tenant_id, run_date, sampling, n_splits=5, ra
         outfile.seek(0)
         boto3.Session().resource('s3')\
             .Bucket(bucket)\
-            .Object(key+'model_data.npz')\
+            .Object(key+filename)\
             .upload_fileobj(outfile)
     print('saved model_data.npz')

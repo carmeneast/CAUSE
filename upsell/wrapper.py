@@ -56,7 +56,8 @@ class CauseWrapper:
 
         # Predict future event intensities on test set
         time_steps = range(self.CONFIG.predict.min_time_steps, self.CONFIG.predict.max_time_steps + 1)
-        intensities, cumulants, log_basis_weights = self.predict(test_event_seqs, time_steps=time_steps)
+        pred_event_seqs = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling, training=False)['event_seqs']
+        intensities, cumulants, log_basis_weights = self.predict(pred_event_seqs, time_steps=time_steps)
         print(intensities.shape, cumulants.shape, log_basis_weights.shape)
 
     def get_device(self, dynamic=False):
@@ -70,7 +71,7 @@ class CauseWrapper:
         return device
 
     def load_event_seqs(self):
-        data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling)
+        data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling, training=True)
         self.n_event_types = data['n_event_types']
         self.event_type_names = data['event_type_names']
         self.account_ids = data['account_ids']
