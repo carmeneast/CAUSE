@@ -202,6 +202,9 @@ class CauseWrapper:
         return metrics
 
     def predict(self, event_seqs, time_steps=range(1, 5)):
+        if self.model is None:
+            self.model = load_pytorch_object(self.bucket, self.tenant_id, self.run_date, self.sampling, 'model')
+
         data_loader = DataLoader(
             EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
         )

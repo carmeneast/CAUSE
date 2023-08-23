@@ -55,4 +55,4 @@ def create_save_event_seqs(bucket, tenant_id, run_date, sampling, n_splits=5, ra
             .Bucket(bucket)\
             .Object(key+filename)\
             .upload_fileobj(outfile)
-    print('saved model_data.npz')
+    print(f'saved {filename}')
