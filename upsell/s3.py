@@ -56,18 +56,12 @@ def load_numpy_data(bucket, tenant_id, run_date, sampling, training=True):
         print('event_seqs', len(event_seqs), event_seqs[0].shape[1])
         account_ids = data['account_ids']
         print('account_ids', account_ids.shape)
-        if training:
-            train_test_splits = data['train_test_splits']
-            print('train_test_splits', len(train_test_splits))
-        else:
-            train_test_splits = None
 
     event_type_names = pd_read_s3_multiple_files(bucket, key+'eventTypeNames', '.csv')
     n_event_types = len(event_type_names)
     print('n_event_types', n_event_types)
     return {
         'event_seqs': event_seqs,
-        'train_test_splits': train_test_splits,
         'account_ids': account_ids,
         'event_type_names': event_type_names,
         'n_event_types': len(event_type_names),

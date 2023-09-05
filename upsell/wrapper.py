@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -32,18 +31,11 @@ class CauseWrapper:
         # initialize model artifacts
         self.n_event_types, self.event_type_names = None, None
         self.model = None
-        self.account_ids = None
-
-        self.data_loader_args = {
-            'batch_size': self.CONFIG.data_loader.batch_size,
-            'collate_fn': EventSeqDataset.collate_fn,
-            'num_workers': self.CONFIG.data_loader.num_workers,
-        }
 
     def run(self):
         # Get event sequences
-        train_event_seqs, test_event_seqs = self.load_event_seqs()
-        train_data_loader, valid_data_loader = self.init_data_loaders(train_event_seqs)
+        train_event_seqs, test_event_seqs = self.load_event_seqs(training=True)
+        train_data_loader, valid_data_loader = self.init_data_loader(train_event_seqs, training=True)
 
         # Train model
         self.init_model()
@@ -56,7 +48,7 @@ class CauseWrapper:
 
         # Predict future event intensities on test set
         time_steps = range(self.CONFIG.predict.min_time_steps, self.CONFIG.predict.max_time_steps + 1)
-        pred_event_seqs = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling, training=False)['event_seqs']
+        pred_event_seqs = self.load_event_seqs(training=False)
         intensities, cumulants, log_basis_weights = self.predict(pred_event_seqs, time_steps=time_steps)
         print(intensities.shape, cumulants.shape, log_basis_weights.shape)
 
@@ -70,38 +62,46 @@ class CauseWrapper:
             device = torch.device('cpu')
         return device
 
-    def load_event_seqs(self):
-        data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling, training=True)
+    def load_event_seqs(self, training=True):
+        data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling, training)
         self.n_event_types = data['n_event_types']
         self.event_type_names = data['event_type_names']
-        self.account_ids = data['account_ids']
-        event_seqs = data['event_seqs']
-        train_test_splits = data['train_test_splits']  # Contains 5 possible train-test splits
+        if training:
+            train_event_seqs = data['train_event_seqs']
+            test_event_seqs = data['test_event_seqs']
 
-        # Randomly select a train-test split
-        split_id = np.random.randint(5)
-        train_event_seqs = event_seqs[train_test_splits[split_id][0]]
-        test_event_seqs = event_seqs[train_test_splits[split_id][1]]
+            # Sort test_event_seqs by sequence length
+            test_event_seqs = sorted(test_event_seqs, key=lambda seq: seq.shape[0])
+            return train_event_seqs, test_event_seqs
+        else:
+            return data['pred_event_seqs']
 
-        # Sort test_event_seqs by sequence length
-        test_event_seqs = sorted(test_event_seqs, key=lambda seq: seq.shape[0])
-        return train_event_seqs, test_event_seqs
+    def init_data_loader(self, event_seqs, shuffle=True, training=True):
+        configs = self.CONFIG.data_loader
+        data_loader_args = {
+            'batch_size': configs.batch_size,
+            'collate_fn': EventSeqDataset.collate_fn,
+            'num_workers': configs.num_workers,
+        }
 
-    def init_data_loaders(self, event_seqs):
-        train_data_loader = DataLoader(
-            EventSeqDataset(event_seqs), **self.data_loader_args
+        data_loader = DataLoader(
+            EventSeqDataset(event_seqs), shuffle=shuffle, **data_loader_args
         )
-        train_data_loader, valid_data_loader = split_data_loader(
-            train_data_loader, self.CONFIG.data_loader.train_validation_split
-        )
-        if self.CONFIG.data_loader.bucket_seqs:
-            train_data_loader = convert_to_bucketed_data_loader(
-                train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset]
+
+        if training:
+            train_data_loader, valid_data_loader = split_data_loader(
+                data_loader, configs.train_validation_split
             )
-        valid_data_loader = convert_to_bucketed_data_loader(
-            valid_data_loader, keys=[x.shape[0] for x in valid_data_loader.dataset], shuffle_same_key=False
-        )
-        return train_data_loader, valid_data_loader
+            if configs.bucket_seqs:
+                train_data_loader = convert_to_bucketed_data_loader(
+                    train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset]
+                )
+            valid_data_loader = convert_to_bucketed_data_loader(
+                valid_data_loader, keys=[x.shape[0] for x in valid_data_loader.dataset], shuffle_same_key=False
+            )
+            return train_data_loader, valid_data_loader
+        else:
+            return data_loader
 
     def init_model(self):
         self.model = ExplainableRecurrentPointProcess(n_event_types=self.n_event_types, **{**self.CONFIG.model})
@@ -191,9 +191,7 @@ class CauseWrapper:
         plt.show()
 
     def calculate_test_metrics(self, event_seqs):
-        data_loader = DataLoader(
-            EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
-        )
+        data_loader = self.init_data_loader(event_seqs, shuffle=False, training=False)
         metrics = self.model.evaluate(data_loader, device=self.device)
         msg = '[Test] ' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
@@ -205,9 +203,7 @@ class CauseWrapper:
         if self.model is None:
             self.model = load_pytorch_object(self.bucket, self.tenant_id, self.run_date, self.sampling, 'model')
 
-        data_loader = DataLoader(
-            EventSeqDataset(event_seqs), shuffle=False, **self.data_loader_args
-        )
+        data_loader = self.init_data_loader(event_seqs, shuffle=False, training=False)
         intensities, cumulants, log_basis_weights = \
             self.model.predict_future_event_intensities(data_loader, self.device, time_steps)
 

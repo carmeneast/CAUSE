@@ -53,56 +53,52 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.n_event_types = n_event_types
 
         # Basis functions
-        if (n_bases is None or max_mean is None) and basis_means is None:
-            raise ValueError('Either (n_bases and max_mean) or basis_means must be specified.')
+        if basis_type in ['equal', 'dyadic'] and (n_bases is None or max_mean is None):
+            raise ValueError(f'n_bases and max_mean must be specified when basis_type={basis_type}')
 
-        if n_bases is None:
-            n_bases = len(basis_means)
-        self.bases = self.define_basis_functions(basis_type, n_bases, max_mean=max_mean,
-                                                 basis_means=basis_means)
+        if basis_type == 'means' and basis_means is None:
+            raise ValueError(f'basis_means must be specified when basis_type={basis_type}')
+
+        self.n_bases = n_bases if n_bases is not None else len(basis_means)
+        self.bases = self.define_basis_functions(basis_type, max_mean=max_mean, basis_means=basis_means)
 
         # Neural networks
         # TODO: move clamping into model
         self.max_log_basis_weight = max_log_basis_weight
-        self.embedder, self.encoder, self.dropout, self.decoder = self.define_model(
-            embedding_dim, hidden_size, rnn, dropout, n_bases
-        )
+        self.embedder, self.encoder, self.dropout, self.decoder = None, None, None, None
+        self.define_model(embedding_dim, hidden_size, rnn, dropout)
 
         # Metrics
-        if ks is None:
-            self.ks = [0.1, 1.0]
-        else:
-            self.ks = ks
+        self.ks = ks if ks is not None else [0.1, 1.0]
         self.metrics = ['nll'] + [f'precision_at_{k}' for k in self.ks]
 
-    def define_model(self, embedding_dim, hidden_size, rnn, dropout, n_bases):
+    def define_model(self, embedding_dim, hidden_size, rnn, dropout):
         # TODO: Move this into nn.Sequential
-        embedder = nn.Linear(self.n_event_types, embedding_dim, bias=False)
-        encoder = getattr(nn, rnn)(
+        self.embedder = nn.Linear(self.n_event_types, embedding_dim, bias=False)
+        self.encoder = getattr(nn, rnn)(
             input_size=embedding_dim + 1,
             hidden_size=hidden_size,
             batch_first=True,
             dropout=dropout,
         )
-        dropout = nn.Dropout(p=dropout)
-        decoder = Decoder(hidden_size, self.n_event_types * (n_bases + 1))
-        return embedder, encoder, dropout, decoder
+        self.dropout = nn.Dropout(p=dropout)
+        self.decoder = Decoder(hidden_size, self.n_event_types * (self.n_bases + 1))
 
-    @staticmethod
-    def define_basis_functions(basis_type, n_bases, max_mean=None, basis_means=None):
+    def define_basis_functions(self, basis_type, max_mean=None, basis_means=None):
         bases = [Unity()]
         if basis_type == 'equal':
-            mu, sigma = [], []
-            for i in range(n_bases):
-                mu.append(i * max_mean / (n_bases - 1))
-                sigma.append(max_mean / (n_bases - 1))
+            x = max_mean / (self.n_bases - 1)
+            mu = [i * x for i in range(self.n_bases)]
+            sigma = [x] * self.n_bases
         elif basis_type == 'dyadic':
-            if basis_means is not None:
-                mu = sorted(basis_means)
+            mu = [0] + sorted([max_mean / 2 ** i for i in range(self.n_bases-1)])
+            sigma = [max_mean / 2 ** (self.n_bases-1) / 3] + [mu / 3 for mu in mu[1:]]
+        elif basis_type == 'means':
+            mu = sorted(basis_means)
+            if mu[0] == 0:
                 sigma = [mu[1] / (2 * 3)] + [mu / 3 for mu in mu[1:]]
             else:
-                mu = [0] + sorted([max_mean / 2 ** i for i in range(n_bases-1)])
-                sigma = [max_mean / 2 ** (n_bases-1) / 3] + [mu / 3 for mu in mu[1:]]
+                sigma = [mu / 3 for mu in mu]
         else:
             raise ValueError(f'Unrecognized basis_type={basis_type}')
 
@@ -110,23 +106,18 @@ class ExplainableRecurrentPointProcess(nn.Module):
         return nn.ModuleList(bases)
 
     def forward(self, event_seqs, return_weights=True, target_type=None):
-        """[summary]
+        """
 
-        Args:
-          event_seqs (Tensor): shape=[batch_size, time_stamps, 1 + n_event_types]
-
-          return_weights (bool): whether to return the basis weights.
-
-          target_type (int): whether to only predict for a specific type
-
-        Returns:
-           log_intensities (Tensor): shape=[batch_size, time_stamps, n_event_types],
-             log conditional intensities evaluated at each event for each type
-             (i.e. starting at t1).
-           weights (Tensor, optional): shape=[batch_size, time_stamps, n_event_types, n_bases],
-             basis weights evaluated at each previous event (i.e., starting at t0).
-             Returned only when `return_weights` is `True`.
-
+        :param event_seqs: (Tensor) shape=[batch_size, time_stamps, 1 + n_event_types]
+        :param return_weights: (bool) whether to return the basis weights
+        :param target_type: (int, optional) specific event type index to predict
+        :return:
+            log_intensities (Tensor): shape=[batch_size, time_stamps, n_event_types],
+                log conditional intensities evaluated at each timestamp for each event type
+                (i.e. starting at t1).
+            weights (Tensor, optional): shape=[batch_size, time_stamps, n_event_types, n_bases],
+                basis weights evaluated at each previous event (i.e., starting at t0).
+                Returned only when `return_weights` is `True`.
         """
         assert event_seqs.size(-1) == 1 + self.n_event_types, event_seqs.size()
         if target_type:
@@ -134,30 +125,53 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         batch_size, time_stamps = event_seqs.size()[:2]
 
+        # GET TIME FEATURES
+        # Timestamps [batch_size, time_stamps + 1]:
         # (t0=0, t1, t2, ..., t_n)
         ts = f.pad(event_seqs[:, :, 0], (1, 0))
+        # Time deltas [batch_size, time_stamps + 1]:
         # (0, t1 - t0, ..., t_{n} - t_{n - 1})
         dt = f.pad(ts[:, 1:] - ts[:, :-1], (1, 0))
+        # Excl final time delta [batch_size, time_stamps, 1]:
         # (0, t1 - t0, ..., t_{n - 1} - t_{n - 2})
-        temp_feat = dt[:, :-1].unsqueeze(-1)
+        time_feat = dt[:, :-1].unsqueeze(-1)
 
+        # EMBED EVENT VECTOR AT EACH TIMESTAMP EXCEPT LAST
+        # In: [batch_size, time_stamps - 1, n_event_types]
+        # Out: [batch_size, time_stamps - 1, embedding_dim]
         # (0, z_1, ..., z_{n - 1})
-        type_feat = self.embedder(event_seqs[:, :-1, 1:])
-        type_feat = f.pad(type_feat, (0, 0, 1, 0))
+        event_emb = self.embedder(event_seqs[:, :-1, 1:])
 
-        feat = torch.cat([temp_feat, type_feat], dim=-1)
-        history_emb, *_ = self.encoder(feat)
-        history_emb = self.dropout(history_emb)
+        # Add time deltas back in: [batch_size, time_stamps, embedding_dim + 1]
+        type_feat = f.pad(event_emb, (0, 0, 1, 0))
+        feat = torch.cat([time_feat, type_feat], dim=-1)
 
-        # [batch_size, time_stamps, n_event_types, n_bases]
-        log_basis_weights = self.decoder(history_emb).view(
+        # ENCODE EVENT HISTORY PER ACCOUNT
+        # In: [batch_size, time_stamps, embedding_dim + 1]
+        # Out: [batch_size, hidden_size]
+        event_hist_emb, *_ = self.encoder(feat)
+
+        # [batch_size, hidden_size]
+        event_hist_emb_w_dropout = self.dropout(event_hist_emb)
+
+        # DECODE INTO WEIGHTS FOR EACH BASIS FUNCTION
+        # In: [batch_size, hidden_size]
+        # Out: [batch_size, time_stamps, n_event_types, n_bases]
+        raw_log_basis_weights = self.decoder(event_hist_emb_w_dropout).view(
             batch_size, time_stamps, self.n_event_types, -1
         )
-        log_basis_weights = torch.clamp(log_basis_weights, max=self.max_log_basis_weight)
+
+        # Cap basis weights to avoid numerical instability
+        # TODO: Can the clamper be defined in self.define_model()?
+        #  - So that it's not redefined on every forward pass
+        #  - So we don't have to make model configs like self.max_log_basis_weight an attribute
+        #  - Requires using a clamping function from torch.nn.functional or subclassing nn.Module
+        log_basis_weights = torch.clamp(raw_log_basis_weights, max=self.max_log_basis_weight)
 
         if target_type:
             log_basis_weights = log_basis_weights[:, :, target_type: target_type + 1]
 
+        # GET CONDITIONAL INTENSITIES FOR EACH EVENT TYPE AT EACH TIMESTAMP
         # [batch_size, time_stamps, 1, n_bases]
         log_basis_probas = torch.cat(
             [basis.log_prob(dt[:, 1:, None]) for basis in self.bases], dim=2
@@ -236,15 +250,14 @@ class ExplainableRecurrentPointProcess(nn.Module):
     def train_epoch(
             self,
             train_data_loader,
-            optim,
+            optimizer,
             valid_data_loader=None,
             device=None,
             **kwargs,
     ):
-        self.train()
-
         train_metrics = {m: MetricTracker(metric=m) for m in ['loss', 'l2_reg'] + self.metrics}
 
+        self.train()
         for batch in train_data_loader:
             if device:
                 batch = batch.to(device)
@@ -270,9 +283,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 l2_reg = 0.0
             loss = nll + l2_reg
 
-            optim.zero_grad()
+            optimizer.zero_grad()
             loss.backward()
-            optim.step()
+            optimizer.step()
 
             train_metrics['loss'].update(loss, batch.size(0))
             train_metrics['nll'].update(nll, batch.size(0))
@@ -388,14 +401,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             batch_size, time_stamps = batch.size()[:2]
             seq_lengths = (batch.abs().sum(-1) > 0).sum(-1)
 
-            inputs = torch.cat(
-                [
-                    batch[:, :, :1],
-                    f.one_hot(batch[:, :, 1].long(), self.n_event_types).float(),
-                ],
-                dim=-1,
-            )
-            baselines = f.pad(inputs[:, :, :1], (0, self.n_event_types))
+            baselines = f.pad(batch[:, :, :1], (0., self.n_event_types))
             mask = generate_sequence_mask(seq_lengths - 1, device=device)
 
             if occurred_type_only:
@@ -414,7 +420,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             for k in occurred_types:
                 ig = batch_integrated_gradient(
                     partial(func, target_type=k),
-                    inputs,
+                    batch,
                     baselines=baselines,
                     mask=mask.unsqueeze(-1),
                     steps=steps,

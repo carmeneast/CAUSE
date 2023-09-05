@@ -2,8 +2,22 @@ env:
   cuda: True
   seed: 42
 
+preprocessing:
+  seed: 42
+  sampling:
+    max_positives: 6000  # This results in a maximum sample size of 102,000 accounts
+    neg_w_activity_prop: 8
+    neg_w_intent_prop: 4
+    neg_w_none_prop: 4
+  firmo_rollup:
+    top_n_categories: 5
+  activity_rollup:
+    min_occurrences: 150
+    min_accounts: 75
+  train_size: 0.8
+
 data_loader:
-  train_validation_split: 0.8888888888888888
+  train_validation_split: 0.85
   bucket_seqs: True
   batch_size: 64
   num_workers: 0
@@ -13,7 +27,7 @@ model:
   hidden_size: 128
   rnn: 'GRU'
   dropout: 0.0
-  basis_type: 'dyadic'
+  basis_type: 'means'
   basis_means:
     - 0
     - 1

@@ -32,7 +32,6 @@ class EventSeqDataset(Dataset):
         return len(self._event_seqs)
 
     def __getitem__(self, i):
-        # TODO: can instead compute the elapsed time between events
         return self._event_seqs[i]
 
     @staticmethod
