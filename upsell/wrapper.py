@@ -48,9 +48,11 @@ class CauseWrapper:
         self.plot_precision_at_k(metrics)
 
         # Predict future event intensities on test set
-        time_steps = range(self.CONFIG.predict.min_time_steps, self.CONFIG.predict.max_time_steps + 1)
         pred_event_seqs = self.load_event_seqs(dataset='pred')
-        intensities, cumulants, log_basis_weights = self.predict(pred_event_seqs, time_steps=time_steps)
+        intensities, cumulants, log_basis_weights = self.predict(
+            pred_event_seqs,
+            time_steps=range(self.CONFIG.predict.min_time_steps, self.CONFIG.predict.max_time_steps + 1)
+        )
         print(intensities.shape, cumulants.shape, log_basis_weights.shape)
 
     def get_device(self, dynamic=False):
@@ -169,7 +171,11 @@ class CauseWrapper:
         for loss_type in ['train', 'valid']:
             for metric in self.model.metrics:
                 history[f'{loss_type}_{metric}'] = epoch_metrics[loss_type][metric].values
-        history.to_csv(f'{self.tenant_id}/{self.run_date}/{self.sampling}/history.csv', index=False)
+        if self.sampling:
+            filename = f'{self.tenant_id}/{self.run_date}/{self.sampling}/history.csv'
+        else:
+            filename = f'{self.tenant_id}/{self.run_date}/history.csv'
+        history.to_csv(filename, index=False)
         return history
 
     def plot_training_loss(self, history, tune_metric):
@@ -178,7 +184,10 @@ class CauseWrapper:
         plt.xlabel('epoch')
         plt.ylabel(tune_metric)
         plt.legend()
-        plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/training_loss.png')
+        if self.sampling:
+            plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/training_loss.png')
+        else:
+            plt.savefig(f'{self.tenant_id}/{self.run_date}/training_loss.png')
         plt.show()
 
     def plot_precision_at_k(self, metrics):
@@ -187,7 +196,10 @@ class CauseWrapper:
         plt.plot(ks, precisions)
         plt.xlabel('Intensity')
         plt.ylabel('Precision @ Intensity')
-        plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/precision_at_k.png')
+        if self.sampling:
+            plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/precision_at_k.png')
+        else:
+            plt.savefig(f'{self.tenant_id}/{self.run_date}/precision_at_k.png')
         plt.show()
 
     def calculate_test_metrics(self, event_seqs):
@@ -195,8 +207,12 @@ class CauseWrapper:
         metrics = self.model.evaluate(data_loader, device=self.device)
         msg = '[Test] ' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
+        if self.sampling:
+            filename = f'{self.tenant_id}/{self.run_date}/{self.sampling}/test_metrics.json'
+        else:
+            filename = f'{self.tenant_id}/{self.run_date}/test_metrics.json'
         pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
-            .to_json(f'{self.tenant_id}/{self.run_date}/{self.sampling}/test_metrics.json')
+            .to_json(filename)
         return metrics
 
     def predict(self, event_seqs, time_steps=range(1, 5)):

@@ -38,7 +38,7 @@ class CausePreprocessing:
         self.n_event_types = None
         self.event_type_names = None
 
-    def run(self, training: bool = True):
+    def run(self, dataset: str = 'train'):
         # Load raw event data
         print('Loading raw event data...')
         raw_data_path = f's3://{self.bucket}/upsell/{self.tenant_id}/{self.run_date}'
@@ -55,30 +55,28 @@ class CausePreprocessing:
         opp_events = self.create_timeline_events(accounts, opps)
         intent_events = self.create_timeline_events(accounts, intent)
 
-        if training:
+        if dataset == 'train':
             print('Sampling accounts...')
             account_sample = self.sample_accounts(accounts, activity_events, opp_events, intent_events)
+            self.save_parquet(account_sample, f'{transformed_data_path}/account_sample')
 
             print('Splitting into train/test...')
             train_accounts, test_accounts = self.train_test_split(account_sample)
+            self.save_parquet(train_accounts, f'{transformed_data_path}/train_accounts')
+            self.save_parquet(test_accounts, f'{transformed_data_path}/test_accounts')
 
-            print('Preprocessing train data...')
-            train_sparse_matrices = self.apply_preprocessing(train_accounts, activity_events, opp_events, intent_events,
-                                                             training=True)
-            self.save_parquet(train_sparse_matrices, f'{transformed_data_path}/train_sparse_matrices')
+            accounts = train_accounts
 
-            print('Preprocessing test data...')
-            test_sparse_matrices = self.apply_preprocessing(test_accounts, activity_events, opp_events, intent_events,
-                                                            training=False)
-            self.save_parquet(test_sparse_matrices, f'{transformed_data_path}/test_sparse_matrices')
-        else:
-            print('Preprocessing prediction data...')
-            sparse_matrices = self.apply_preprocessing(accounts, activity_events, opp_events, intent_events,
-                                                       training=False)
-            self.save_parquet(sparse_matrices, f'{transformed_data_path}/pred_sparse_matrices')
+        elif dataset == 'test':
+            accounts = self.spark.read.parquet(f'{transformed_data_path}/test_accounts')
+
+        print(f'Preprocessing {dataset} data...')
+        sparse_matrices = self.apply_preprocessing(accounts, activity_events, opp_events, intent_events,
+                                                   dataset=dataset)
+        self.save_parquet(sparse_matrices, f'{transformed_data_path}/{dataset}_sparse_matrices')
 
     def apply_preprocessing(self, accounts: DataFrame, activity_events: DataFrame,
-                            opp_events: DataFrame, intent_events: DataFrame, training: bool = True):
+                            opp_events: DataFrame, intent_events: DataFrame, dataset: str = 'train'):
         model_path = f'upsell/{self.tenant_id}/{self.run_date}/'  # {self.sampling}'
         transformed_data_path = f's3://{self.bucket}/{model_path}'
 
@@ -86,7 +84,7 @@ class CausePreprocessing:
         print('Cleaning firmographics data...')
         accounts_cleaned = self.clean_firmographics(accounts)
 
-        if training:
+        if dataset == 'train':
             # Fit firmographic roll-up
             print('Fitting firmographic roll-up...')
             self.firmo_rollup, self.firmo_categories = self.fit_firmographic_roll_up(accounts_cleaned)
@@ -136,7 +134,7 @@ class CausePreprocessing:
         all_events = self.combine_events(accounts_transformed, firmo_events, opp_events, intent_events,
                                          activities_transformed)
 
-        if training:
+        if dataset == 'train':
             # Get event type names
             print('Getting event type names...')
             self.event_type_names = all_events.select('event_type').distinct().orderBy('event_type').coalesce(1).cache()
@@ -442,7 +440,7 @@ class CausePreprocessing:
         padded_event_agg = padded_event_agg.na.fill(0)
 
         # Convert to sparse vector
-        # It doesn't matter if we're in training mode or not because the input columns are created
+        # It doesn't matter if we're training or not because the input columns are created
         # using event_type_names, which is created from the training data.
         # Since event_type_names is saved during training, it's not necessary to save the VectorAssembler
         vec_assembler = VectorAssembler(
