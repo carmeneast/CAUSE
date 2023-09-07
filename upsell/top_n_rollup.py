@@ -24,7 +24,8 @@ class TopNCategoryRollUp(Estimator, DefaultParamsReadable, DefaultParamsWritable
     def _fit(self, df: DataFrame):
         top_n_validate_schema(self.input_col, df.schema)
 
-        categories = df.groupBy(self.input_col) \
+        categories = df.filter(col(self.input_col).isNotNull())\
+            .groupBy(self.input_col) \
             .count() \
             .orderBy(desc('count')) \
             .limit(self.n_categories) \

@@ -11,13 +11,15 @@ def activity_validate_schema(schema: StructType) -> None:
 
 
 def roll_up_event_type(event_type_col: Column, level: int) -> Column:
-    if level == 1:
-        return concat(split(event_type_col, '\\|').getItem(0), lit('|'),
-                      split(event_type_col, '\\|').getItem(1), lit(f'|<RARE CATEGORIES>'))
+    if level == 0:
+        return event_type_col
+    elif level == 1:
+        return concat(split(event_type_col, '__').getItem(0), lit('__'),
+                      split(event_type_col, '__').getItem(1), lit('__RARE_CATEGORIES'))
     elif level == 2:
-        return concat(split(event_type_col, '\\|').getItem(0), lit(f'|<RARE ROLES + CATEGORIES>'))
+        return concat(split(event_type_col, '__').getItem(0), lit('__RARE_ROLE_CATEGORIES'))
     elif level == 3:
-        return lit(f'<RARE ACTIVITY + ROLE + CATEGORIES>')
+        return lit(f'RARE_ACTIVITY_ROLE_CATEGORIES')
     else:
         raise ValueError(f'Invalid rollup level: {level}')
 
@@ -31,6 +33,9 @@ class ActivityRoleCategoryRollUp(Estimator, DefaultParamsReadable, DefaultParams
 
     def _fit(self, df: DataFrame):
         activity_validate_schema(df.schema)
+
+        # Clean up event type names
+        df = df.withColumn('event_type', roll_up_event_type(col('event_type'), level=0))
 
         # Get activity + role + category combinations large enough to not roll up
         act_role_cat = df.groupBy('event_type') \
@@ -100,12 +105,13 @@ class ActivityRoleCategoryRollUpModel(Model, DefaultParamsReadable, DefaultParam
         activity_validate_schema(df.schema)
 
         return df\
+            .withColumn('rollup0', roll_up_event_type(col('event_type'), level=0))\
             .withColumn('rollup1', roll_up_event_type(col('event_type'), level=1))\
             .withColumn('rollup2', roll_up_event_type(col('event_type'), level=2))\
             .withColumn('rollup3', roll_up_event_type(col('event_type'), level=3))\
             .withColumn(
                 'event_type',
-                when(col('event_type').isin(self.activities), col('event_type'))
+                when(col('rollup0').isin(self.activities), col('rollup0'))
                 .when(col('rollup1').isin(self.activities), col('rollup1'))
                 .when(col('rollup2').isin(self.activities), col('rollup2'))
                 .otherwise(col('rollup3'))
