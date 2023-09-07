@@ -40,13 +40,16 @@ def pd_read_s3_multiple_files(bucket, key, file_suffix='.csv', verbose=False):
     return final
 
 
-def s3_key(tenant_id, run_date, sampling):
-    return f'upsell/{tenant_id}/{run_date}/{sampling}/'
+def s3_key(tenant_id, run_date, sampling=None):
+    if sampling:
+        return f'upsell/{tenant_id}/{run_date}/{sampling}/'
+    else:
+        return f'upsell/{tenant_id}/{run_date}/'
 
 
-def load_numpy_data(bucket, tenant_id, run_date, sampling, training=True):
+def load_numpy_data(bucket, tenant_id, run_date, sampling=None, dataset='train'):
     key = s3_key(tenant_id, run_date, sampling)
-    filename = 'model_train_data.npz' if training else 'model_pred_data.npz'
+    filename = f'{dataset}_model_data.npz'
     with BytesIO() as obj:
         boto3.resource('s3').Bucket(bucket).download_fileobj(key+filename, obj)
         obj.seek(0)
@@ -57,7 +60,7 @@ def load_numpy_data(bucket, tenant_id, run_date, sampling, training=True):
         account_ids = data['account_ids']
         print('account_ids', account_ids.shape)
 
-    event_type_names = pd_read_s3_multiple_files(bucket, key+'eventTypeNames', '.csv')
+    event_type_names = pd_read_s3_multiple_files(bucket, key+'event_type_names/', '.parquet')
     n_event_types = len(event_type_names)
     print('n_event_types', n_event_types)
     return {
@@ -76,7 +79,7 @@ def save_pytorch_dataset(dataset, bucket, tenant_id, run_date, sampling, name):
     s3.put_object(Bucket=bucket, Key=key+name+'.pt', Body=buffer.getvalue())
 
 
-def save_pytorch_model(model, bucket, tenant_id, run_date, sampling):
+def save_pytorch_model(model, bucket, tenant_id, run_date, sampling=None):
     key = s3_key(tenant_id, run_date, sampling)
     s3 = boto3.client('s3')
     buffer = BytesIO()

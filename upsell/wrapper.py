@@ -34,8 +34,9 @@ class CauseWrapper:
 
     def run(self):
         # Get event sequences
-        train_event_seqs, test_event_seqs = self.load_event_seqs(training=True)
-        train_data_loader, valid_data_loader = self.init_data_loader(train_event_seqs, training=True)
+        train_event_seqs = self.load_event_seqs(dataset='train')
+        test_event_seqs = self.load_event_seqs(dataset='test')
+        train_data_loader, valid_data_loader = self.init_data_loader(train_event_seqs, dataset='train')
 
         # Train model
         self.init_model()
@@ -48,7 +49,7 @@ class CauseWrapper:
 
         # Predict future event intensities on test set
         time_steps = range(self.CONFIG.predict.min_time_steps, self.CONFIG.predict.max_time_steps + 1)
-        pred_event_seqs = self.load_event_seqs(training=False)
+        pred_event_seqs = self.load_event_seqs(dataset='pred')
         intensities, cumulants, log_basis_weights = self.predict(pred_event_seqs, time_steps=time_steps)
         print(intensities.shape, cumulants.shape, log_basis_weights.shape)
 
@@ -62,21 +63,19 @@ class CauseWrapper:
             device = torch.device('cpu')
         return device
 
-    def load_event_seqs(self, training=True):
-        data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling, training)
+    def load_event_seqs(self, dataset='train'):
+        data = load_numpy_data(self.bucket, self.tenant_id, self.run_date, self.sampling, dataset)
         self.n_event_types = data['n_event_types']
         self.event_type_names = data['event_type_names']
-        if training:
-            train_event_seqs = data['train_event_seqs']
-            test_event_seqs = data['test_event_seqs']
+        event_seqs = data['event_seqs']
 
+        if dataset == 'test':
             # Sort test_event_seqs by sequence length
-            test_event_seqs = sorted(test_event_seqs, key=lambda seq: seq.shape[0])
-            return train_event_seqs, test_event_seqs
-        else:
-            return data['pred_event_seqs']
+            event_seqs = sorted(event_seqs, key=lambda seq: seq.shape[0])
 
-    def init_data_loader(self, event_seqs, shuffle=True, training=True):
+        return event_seqs
+
+    def init_data_loader(self, event_seqs, dataset='train'):
         configs = self.CONFIG.data_loader
         data_loader_args = {
             'batch_size': configs.batch_size,
@@ -84,11 +83,12 @@ class CauseWrapper:
             'num_workers': configs.num_workers,
         }
 
+        shuffle = (dataset == 'train')
         data_loader = DataLoader(
             EventSeqDataset(event_seqs), shuffle=shuffle, **data_loader_args
         )
 
-        if training:
+        if dataset == 'train':
             train_data_loader, valid_data_loader = split_data_loader(
                 data_loader, configs.train_validation_split
             )
@@ -191,7 +191,7 @@ class CauseWrapper:
         plt.show()
 
     def calculate_test_metrics(self, event_seqs):
-        data_loader = self.init_data_loader(event_seqs, shuffle=False, training=False)
+        data_loader = self.init_data_loader(event_seqs, dataset='test')
         metrics = self.model.evaluate(data_loader, device=self.device)
         msg = '[Test] ' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
         print(msg)  # logger.info(msg)
@@ -203,7 +203,7 @@ class CauseWrapper:
         if self.model is None:
             self.model = load_pytorch_object(self.bucket, self.tenant_id, self.run_date, self.sampling, 'model')
 
-        data_loader = self.init_data_loader(event_seqs, shuffle=False, training=False)
+        data_loader = self.init_data_loader(event_seqs, dataset='pred')
         intensities, cumulants, log_basis_weights = \
             self.model.predict_future_event_intensities(data_loader, self.device, time_steps)
 
