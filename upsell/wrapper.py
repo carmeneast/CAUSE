@@ -133,7 +133,8 @@ class CauseWrapper:
                 optimizer,
                 valid_data_loader,
                 device=self.device,
-                **configs,
+                # Unload remaining configs besides optimizer
+                **{k: v for k, v in configs.items() if k != 'optimizer'},
             )
             # Store training and validation metrics for this epoch
             for loss_type in ['train', 'valid']:
