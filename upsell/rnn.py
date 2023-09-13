@@ -5,9 +5,11 @@ from torch import nn
 import torch.nn.functional as f
 from tqdm import tqdm
 
-from upsell.utils import batch_integrated_gradient, generate_sequence_mask, set_eval_mode
 from upsell.basis_functions import Normal, Unity
+from upsell.explain import batch_integrated_gradient
 from upsell.metric_tracker import MetricTracker
+from upsell.utils.env import set_eval_mode
+from upsell.utils.data_loader import generate_sequence_mask
 
 
 class Decoder(nn.Module):
@@ -37,11 +39,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
             # Neural networks
             embedding_dim: int = 32,
             hidden_size: int = 32,
-            rnn: str = "GRU",
+            rnn: str = 'GRU',
             dropout: float = 0.0,
             max_log_basis_weight: float = 30.0,
             # Basis functions
-            basis_type: str = "normal",
+            basis_type: str = 'normal',
             n_bases: int = None,
             max_mean: float = None,
             basis_means: list = None,
@@ -120,7 +122,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 Returned only when `return_weights` is `True`.
         """
         assert event_seqs.size(-1) == 1 + self.n_event_types, event_seqs.size()
-        if target_type:
+        if target_type is not None:
             assert 0 <= target_type < self.n_event_types, target_type
 
         batch_size, time_stamps = event_seqs.size()[:2]
@@ -164,11 +166,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
         # Cap basis weights to avoid numerical instability
         # TODO: Can the clamper be defined in self.define_model()?
         #  - So that it's not redefined on every forward pass
-        #  - So we don't have to make model configs like self.max_log_basis_weight an attribute
+        #  - So we don't have to make model configs like self.max_log_basis_weight a class attribute
         #  - Requires using a clamping function from torch.nn.functional or subclassing nn.Module
         log_basis_weights = torch.clamp(raw_log_basis_weights, max=self.max_log_basis_weight)
 
-        if target_type:
+        if target_type is not None:
             log_basis_weights = log_basis_weights[:, :, target_type: target_type + 1]
 
         # GET CONDITIONAL INTENSITIES FOR EACH EVENT TYPE AT EACH TIMESTAMP
@@ -270,9 +272,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
             nll = self._eval_nll(
                 batch, log_intensities, log_basis_weights, mask
             )
-            if kwargs["l2_reg"] > 0:
+            if kwargs['l2_reg'] > 0:
                 l2_reg = (
-                        kwargs["l2_reg"]
+                        kwargs['l2_reg']
                         * log_basis_weights.permute(2, 3, 0, 1)
                         .masked_select(mask)
                         .exp()
@@ -378,21 +380,30 @@ class ExplainableRecurrentPointProcess(nn.Module):
             steps=50,
             occurred_type_only=False,
     ):
-        def func(x, target_type):
+        def get_attribution_target(x, target_type):
+            # Attribution target: cumulative intensity from t_i to t_i+1
             _, log_basis_weights = self.forward(
                 x, return_weights=True, target_type=target_type
             )
             cumulants = self._eval_cumulants(x, log_basis_weights)
-            # drop index=0 as it corresponds to (t_0, t_1)
+            # Drop first timestamp as it corresponds to intensity between (t_0, t_1)
             return cumulants[:, 1:]
 
+        # Set module.training = False for Dropout layer and True for all other layers
         set_eval_mode(self)
-        # freeze the model parameters to reduce unnecessary backpropagation.
+
+        # Freeze the model parameters to reduce unnecessary backpropagation
         for param in self.parameters():
             param.requires_grad_(False)
 
+        # Track attribution for each event type on other event types
+        # A(i, j) = the event contribution of the j-th event type to the cumulative intensity prediction
+        # of the i-th event type, relative to the baseline of 0.
+        # Shape: [n_event_types, n_event_types]
         A = torch.zeros(self.n_event_types, self.n_event_types, device=device)
-        type_counts = torch.zeros(self.n_event_types, device=device).long()
+
+        # Track occurrences of each event type. Shape: [n_event_types]
+        type_counts = torch.zeros(self.n_event_types, device=device)
 
         for batch in tqdm(data_loader):
             if device:
@@ -401,50 +412,46 @@ class ExplainableRecurrentPointProcess(nn.Module):
             batch_size, time_stamps = batch.size()[:2]
             seq_lengths = (batch.abs().sum(-1) > 0).sum(-1)
 
-            baselines = f.pad(batch[:, :, :1], (0., self.n_event_types))
+            # Baseline = timestamps with a vector of zeros
+            # Size: [batch_size, time_stamps, n_event_types+1]
+            baselines = f.pad(batch[:, :, :1], (0, self.n_event_types))
+
+            # [batch_size, time_stamps-1]
             mask = generate_sequence_mask(seq_lengths - 1, device=device)
 
             if occurred_type_only:
-                occurred_types = set(
-                    batch[:, :, 1]
-                    .masked_select(generate_sequence_mask(seq_lengths))
-                    .long()
-                    .tolist()
-                )
+                # Get indexes of event types that occurred in the batch
+                occurred_types = set(batch[:, :, 1:].nonzero()[:, -1].tolist())
             else:
+                # Get indexes of all event types
                 occurred_types = range(self.n_event_types)
 
-            event_scores = torch.zeros(
-                self.n_event_types, batch_size, time_stamps - 1, device=device
-            )
+            # Track gradient for each event type. Shape: [n_event_types, batch_size, time_stamps-1]
+            event_scores = torch.zeros(self.n_event_types, batch_size, time_stamps - 1, device=device)
+
             for k in occurred_types:
+                # Compute integrated gradients for each event type
+                # Shape: [batch_size, time_stamps-1, n_event_types+1]
                 ig = batch_integrated_gradient(
-                    partial(func, target_type=k),
+                    partial(get_attribution_target, target_type=k),
                     batch,
                     baselines=baselines,
-                    mask=mask.unsqueeze(-1),
+                    mask=mask.unsqueeze(-1),  # [batch_size, time_stamps-1, 1]
                     steps=steps,
                 )
                 event_scores[k] = ig[:, :-1].sum(-1)
 
-            # shape=[n_event_types, batch_size, time_stamps-1]
-            A.scatter_add_(
-                1,
-                index=batch[:, :-1, 1]
-                .long()
-                .view(1, -1)
-                .expand(self.n_event_types, -1),
-                src=event_scores.view(self.n_event_types, -1),
-            )
+            # Update attribution matrix with the gradient of each event type w.r.t. each event type
+            in_events = batch[:, :-1, 1:]
+            for out_event_idx in range(self.n_event_types):
+                for b, t, in_event_idx in in_events.nonzero():
+                    # Gradient of out_event_idx for the account + timestamp where in_event_idx occurred
+                    A[out_event_idx, in_event_idx] += event_scores[out_event_idx, b, t]
 
-            ks = (
-                batch[:, :, 1]
-                .long()
-                .masked_select(generate_sequence_mask(seq_lengths))
-            )
-            type_counts.scatter_add_(0, index=ks, src=torch.ones_like(ks))
+            # Sum the weights for each event type across timestamps and accounts
+            type_counts += batch[:, :, 1:].sum([0, 1])
 
-        # plus one to avoid division by zero
-        A /= type_counts[None, :].float() + 1
+        # Plus one to avoid division by zero
+        A /= type_counts[None, :] + 1
 
         return A.detach().cpu()

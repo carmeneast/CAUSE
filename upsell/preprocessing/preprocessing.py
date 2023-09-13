@@ -8,9 +8,9 @@ from pyspark.ml.pipeline import Pipeline, PipelineModel
 from typing import Dict, List, Optional, Tuple
 
 from upsell.configs import load_yaml_config
-from upsell.country_map import COUNTRY_MAP
-from upsell.top_n_rollup import TopNCategoryRollUp, TopNCategoryRollUpModel
-from upsell.activity_rollup import ActivityRoleCategoryRollUp, ActivityRoleCategoryRollUpModel
+from upsell.preprocessing.country_map import COUNTRY_MAP
+from upsell.preprocessing.top_n_rollup import TopNCategoryRollUp, TopNCategoryRollUpModel
+from upsell.preprocessing.activity_rollup import ActivityRoleCategoryRollUp, ActivityRoleCategoryRollUpModel
 
 
 class CausePreprocessing:

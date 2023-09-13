@@ -50,6 +50,7 @@ def s3_key(tenant_id, run_date, sampling=None):
 def load_numpy_data(bucket, tenant_id, run_date, sampling=None, dataset='train'):
     key = s3_key(tenant_id, run_date, sampling)
     filename = f'{dataset}_model_data.npz'
+    print(f'Loading s3://{bucket}/{key}{filename}')
     with BytesIO() as obj:
         boto3.resource('s3').Bucket(bucket).download_fileobj(key+filename, obj)
         obj.seek(0)

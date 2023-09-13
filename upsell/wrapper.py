@@ -8,8 +8,9 @@ from upsell.configs import load_yaml_config
 from upsell.event_seq_dataset import EventSeqDataset
 from upsell.metric_tracker import MetricTracker
 from upsell.rnn import ExplainableRecurrentPointProcess
-from upsell.s3 import load_numpy_data, load_pytorch_object, save_pytorch_dataset, save_pytorch_model
-from upsell.utils import convert_to_bucketed_data_loader, get_freer_gpu, set_rand_seed, split_data_loader
+from upsell.utils.data_loader import split_data_loader, convert_to_bucketed_data_loader
+from upsell.utils.env import get_freer_gpu, set_rand_seed
+from upsell.utils.s3 import load_numpy_data, load_pytorch_object, save_pytorch_dataset, save_pytorch_model
 
 
 class CauseWrapper:
@@ -224,7 +225,8 @@ class CauseWrapper:
         intensities, cumulants, log_basis_weights = \
             self.model.predict_future_event_intensities(data_loader, self.device, time_steps)
 
-        for dataset, name in [(intensities, 'event_intensities'), (cumulants, 'event_cumulants'),
+        for dataset, name in [(intensities, 'event_intensities'),
+                              (cumulants, 'event_cumulants'),
                               (log_basis_weights, 'log_basis_weights')]:
             save_pytorch_dataset(dataset, self.bucket, self.tenant_id, self.run_date, self.sampling, name)
 

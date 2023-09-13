@@ -4,7 +4,7 @@ import tempfile
 from scipy import sparse
 from datetime import datetime
 
-from upsell.s3 import pd_read_s3_multiple_files, s3_key
+from upsell.utils.s3 import pd_read_s3_multiple_files, s3_key
 
 
 def convert_to_series_of_sparse_matrices(event_df):
