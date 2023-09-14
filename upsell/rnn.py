@@ -3,9 +3,12 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as f
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from typing import Dict, List, Optional, Tuple, Union
 
 from upsell.basis_functions import Normal, Unity
+from upsell.event_seq_dataset import EventSeqDataset
 from upsell.explain import batch_integrated_gradient
 from upsell.metric_tracker import MetricTracker
 from upsell.utils.env import set_eval_mode
@@ -44,9 +47,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
             max_log_basis_weight: float = 30.0,
             # Basis functions
             basis_type: str = 'normal',
-            n_bases: int = None,
-            max_mean: float = None,
-            basis_means: list = None,
+            n_bases: Optional[int] = None,
+            max_mean: Optional[float] = None,
+            basis_means: Optional[List[Union[int, float]]] = None,
             # Metrics
             ks: list = None,
             **kwargs
@@ -74,7 +77,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.ks = ks if ks is not None else [0.1, 1.0]
         self.metrics = ['nll'] + [f'precision_at_{k}' for k in self.ks]
 
-    def define_model(self, embedding_dim, hidden_size, rnn, dropout):
+    def define_model(self, embedding_dim: int, hidden_size: int, rnn: str, dropout: float) -> None:
         # TODO: Move this into nn.Sequential
         self.embedder = nn.Linear(self.n_event_types, embedding_dim, bias=False)
         self.encoder = getattr(nn, rnn)(
@@ -86,7 +89,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         self.decoder = Decoder(hidden_size, self.n_event_types * (self.n_bases + 1))
 
-    def define_basis_functions(self, basis_type, max_mean=None, basis_means=None):
+    def define_basis_functions(self, basis_type: str, max_mean=None, basis_means=None) -> nn.ModuleList:
         bases = [Unity()]
         if basis_type == 'equal':
             x = max_mean / (self.n_bases - 1)
@@ -107,7 +110,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
         bases.append(Normal(mu=mu, sigma=sigma))
         return nn.ModuleList(bases)
 
-    def forward(self, event_seqs, return_weights=True, target_type=None):
+    def forward(
+        self,
+        event_seqs: EventSeqDataset,
+        return_weights: bool = True,
+        target_type: Optional[Union[int, List[int]]] = None
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
 
         :param event_seqs: (Tensor) shape=[batch_size, time_stamps, 1 + n_event_types]
@@ -187,7 +195,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         else:
             return log_intensities
 
-    def _eval_cumulants(self, batch, log_basis_weights):
+    def _eval_cumulants(self, batch: torch.Tensor, log_basis_weights: torch.Tensor) -> torch.Tensor:
         """
         Evaluate the cumulants (i.e., integral of CIFs at each location)
         """
@@ -205,7 +213,8 @@ class ExplainableRecurrentPointProcess(nn.Module):
         cumulants = integrals.unsqueeze(2).mul(log_basis_weights.exp()).sum(-1)
         return cumulants
 
-    def _eval_nll(self, batch, log_intensities, log_basis_weights, mask, debug=False):
+    def _eval_nll(self, batch: torch.Tensor, log_intensities: torch.Tensor,
+                  log_basis_weights: torch.Tensor, mask: torch.Tensor, debug: bool = False) -> float:
         """
         Evaluate the negative log loss at each location
         1. Intensity of the events that actually occurred at t_i+1
@@ -239,7 +248,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         return (loss_part1 + loss_part2) / batch.size(0)
 
     @staticmethod
-    def _eval_precision_at_k(batch, log_intensities, k=1.0):
+    def _eval_precision_at_k(batch: torch.Tensor, log_intensities: torch.Tensor, k: float = 1.0) -> Tuple[float, int]:
         # Select events with intensity >= k
         mask = log_intensities >= np.log(k)
         high_intensity_events = batch[:, :, 1:].masked_select(mask)
@@ -251,12 +260,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
     def train_epoch(
             self,
-            train_data_loader,
-            optimizer,
-            valid_data_loader=None,
-            device=None,
+            train_data_loader: DataLoader,
+            optimizer: torch.optim.Optimizer,
+            valid_data_loader: Optional[DataLoader] = None,
+            device: Optional = None,
             **kwargs,
-    ):
+    ) -> Tuple[Dict[str, MetricTracker], Dict[str, MetricTracker]]:
         train_metrics = {m: MetricTracker(metric=m) for m in ['loss', 'l2_reg'] + self.metrics}
 
         self.train()
@@ -303,7 +312,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         return train_metrics, valid_metrics
 
-    def evaluate(self, data_loader, device=None):
+    def evaluate(self, data_loader: DataLoader, device: Optional = None) -> Dict[str, MetricTracker]:
         metrics = {m: MetricTracker(metric=m) for m in self.metrics}
 
         self.eval()
@@ -329,7 +338,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         return metrics
 
-    def predict_future_event_intensities(self, data_loader, device, time_steps=range(1, 31)):
+    def predict_future_event_intensities(
+            self,
+            data_loader: DataLoader,
+            device: Optional = None,
+            time_steps: List[int] = range(1, 31)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_intensities, batch_cumulants, batch_log_basis_weights = [], [], []
         with torch.no_grad():
             for batch in tqdm(data_loader):
@@ -375,11 +389,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
     def get_infectivity(
             self,
-            data_loader,
-            device=None,
-            steps=50,
-            occurred_type_only=False,
-    ):
+            data_loader: DataLoader,
+            device: Optional = None,
+            steps: int = 50,
+            occurred_type_only: bool = False,
+    ) -> torch.Tensor:
         def get_attribution_target(x, target_type):
             # Attribution target: cumulative intensity from t_i to t_i+1
             _, log_basis_weights = self.forward(
@@ -443,10 +457,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
             # Update attribution matrix with the gradient of each event type w.r.t. each event type
             in_events = batch[:, :-1, 1:]
-            for out_event_idx in range(self.n_event_types):
-                for b, t, in_event_idx in in_events.nonzero():
-                    # Gradient of out_event_idx for the account + timestamp where in_event_idx occurred
-                    A[out_event_idx, in_event_idx] += event_scores[out_event_idx, b, t]
+            for b, t, k in in_events.nonzero().tolist():
+                # A[:, k] = impact of event k on all event types
+                # event_scores[:, b, t] = gradient of each event type at the account + timestamp where event k occurred
+                # Multiply the gradient by the weight of the event k at account b + timestamp t
+                A[:, k] += (in_events[b, t, k] * event_scores[:, b, t])
 
             # Sum the weights for each event type across timestamps and accounts
             type_counts += batch[:, :, 1:].sum([0, 1])
