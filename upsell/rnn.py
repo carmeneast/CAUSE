@@ -3,13 +3,13 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as f
+from torch import FloatTensor, BoolTensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple, Union
 
 from upsell.basis_functions import Normal, Unity
-from upsell.event_seq_dataset import EventSeqDataset
-from upsell.explain import batch_integrated_gradient
+from upsell.explain import batch_grad
 from upsell.metric_tracker import MetricTracker
 from upsell.utils.env import set_eval_mode
 from upsell.utils.data_loader import generate_sequence_mask
@@ -75,7 +75,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         # Metrics
         self.ks = ks if ks is not None else [0.1, 1.0]
-        self.metrics = ['nll'] + [f'precision_at_{k}' for k in self.ks]
+        self.metrics = ['nll'] + [f'avg_incidence_at_{k}' for k in self.ks]
 
     def define_model(self, embedding_dim: int, hidden_size: int, rnn: str, dropout: float) -> None:
         # TODO: Move this into nn.Sequential
@@ -112,10 +112,10 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
     def forward(
         self,
-        event_seqs: EventSeqDataset,
+        event_seqs: FloatTensor,
         return_weights: bool = True,
         target_type: Optional[Union[int, List[int]]] = None
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[FloatTensor, Tuple[FloatTensor, FloatTensor]]:
         """
 
         :param event_seqs: (Tensor) shape=[batch_size, time_stamps, 1 + n_event_types]
@@ -195,7 +195,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         else:
             return log_intensities
 
-    def _eval_cumulants(self, batch: torch.Tensor, log_basis_weights: torch.Tensor) -> torch.Tensor:
+    def _eval_cumulants(self, batch: FloatTensor, log_basis_weights: FloatTensor) -> FloatTensor:
         """
         Evaluate the cumulants (i.e., integral of CIFs at each location)
         """
@@ -213,10 +213,10 @@ class ExplainableRecurrentPointProcess(nn.Module):
         cumulants = integrals.unsqueeze(2).mul(log_basis_weights.exp()).sum(-1)
         return cumulants
 
-    def _eval_nll(self, batch: torch.Tensor, log_intensities: torch.Tensor,
-                  log_basis_weights: torch.Tensor, mask: torch.Tensor, debug: bool = False) -> float:
+    def _eval_nll(self, batch: FloatTensor, log_intensities: FloatTensor,
+                  log_basis_weights: FloatTensor, mask: BoolTensor, debug: bool = False) -> float:
         """
-        Evaluate the negative log loss at each location
+        Evaluate the negative log loss at each timestamp
         1. Intensity of the events that actually occurred at t_i+1
         2. Intensity of no other events occurring between t_i and t_i+1
         """
@@ -248,15 +248,17 @@ class ExplainableRecurrentPointProcess(nn.Module):
         return (loss_part1 + loss_part2) / batch.size(0)
 
     @staticmethod
-    def _eval_precision_at_k(batch: torch.Tensor, log_intensities: torch.Tensor, k: float = 1.0) -> Tuple[float, int]:
-        # Select events with intensity >= k
-        mask = log_intensities >= np.log(k)
-        high_intensity_events = batch[:, :, 1:].masked_select(mask)
+    def _eval_avg_incidence_at_k(batch: FloatTensor, log_intensities: FloatTensor, k: float = 1.0, eps: float = 0.1)\
+            -> Tuple[float, int]:
+        # Select events with 0.95k <= intensity < 1.05k
+        mask = (log_intensities >= np.log(k * (1 - eps/2))) &\
+               (log_intensities < np.log(k * (1 + eps/2)))
+        events_w_intensity_k = batch[:, :, 1:].masked_select(mask)
 
-        # Check which events actually occurred (ignoring event weights)
-        precision = (high_intensity_events > 0).float().mean()
-        n = len(high_intensity_events)
-        return precision, n
+        # Check average incidence of events with intensity >= k
+        avg_incidence = events_w_intensity_k.mean()
+        n = len(events_w_intensity_k)
+        return avg_incidence, n
 
     def train_epoch(
             self,
@@ -302,8 +304,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
             train_metrics['nll'].update(nll, batch.size(0))
             train_metrics['l2_reg'].update(l2_reg, seq_length.sum())
             for k in self.ks:
-                p, n = self._eval_precision_at_k(batch, log_intensities, k)
-                train_metrics[f'precision_at_{k}'].update(p, n)
+                p, n = self._eval_avg_incidence_at_k(batch, log_intensities, k)
+                if n > 0:
+                    train_metrics[f'avg_incidence_at_{k}'].update(p, n)
 
         if valid_data_loader:
             valid_metrics = self.evaluate(valid_data_loader, device=device)
@@ -333,8 +336,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
                 metrics['nll'].update(nll, batch.size(0))
                 for k in self.ks:
-                    p, n = self._eval_precision_at_k(batch, log_intensities, k)
-                    metrics[f'precision_at_{k}'].update(p, n)
+                    p, n = self._eval_avg_incidence_at_k(batch, log_intensities, k)
+                    if n > 0:
+                        metrics[f'avg_incidence_at_{k}'].update(p, n)
 
         return metrics
 
@@ -343,7 +347,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             data_loader: DataLoader,
             device: Optional = None,
             time_steps: List[int] = range(1, 31)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[FloatTensor, FloatTensor, FloatTensor]:
         batch_intensities, batch_cumulants, batch_log_basis_weights = [], [], []
         with torch.no_grad():
             for batch in tqdm(data_loader):
@@ -357,7 +361,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 last_log_basis_weights = torch.cat(
                     [log_basis_weights[i][j-1].unsqueeze(0) for i, j in enumerate(seq_length)])
 
-                dt = torch.tensor([[day] for day in time_steps])
+                dt = torch.Tensor([[day] for day in time_steps])
 
                 # PDF -> INTENSITIES
                 # Get the probability for time = dt from each basis function [time_steps, n_bases]
@@ -393,7 +397,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             device: Optional = None,
             steps: int = 50,
             occurred_type_only: bool = False,
-    ) -> torch.Tensor:
+    ) -> FloatTensor:
         def get_attribution_target(x, target_type):
             # Attribution target: cumulative intensity from t_i to t_i+1
             _, log_basis_weights = self.forward(
@@ -411,10 +415,10 @@ class ExplainableRecurrentPointProcess(nn.Module):
             param.requires_grad_(False)
 
         # Track attribution for each event type on other event types
-        # A(i, j) = the event contribution of the j-th event type to the cumulative intensity prediction
-        # of the i-th event type, relative to the baseline of 0.
+        # attr_matrix[i, j] = the event contribution of the j-th event type to the cumulative intensity
+        #     prediction of the i-th event type, relative to the baseline of 0.
         # Shape: [n_event_types, n_event_types]
-        A = torch.zeros(self.n_event_types, self.n_event_types, device=device)
+        attr_matrix = torch.zeros(self.n_event_types, self.n_event_types, device=device)
 
         # Track occurrences of each event type. Shape: [n_event_types]
         type_counts = torch.zeros(self.n_event_types, device=device)
@@ -431,7 +435,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             baselines = f.pad(batch[:, :, :1], (0, self.n_event_types))
 
             # [batch_size, time_stamps-1]
-            mask = generate_sequence_mask(seq_lengths - 1, device=device)
+            mask = generate_sequence_mask(seq_lengths - 1, device=device).unsqueeze(-1)
 
             if occurred_type_only:
                 # Get indexes of event types that occurred in the batch
@@ -443,30 +447,52 @@ class ExplainableRecurrentPointProcess(nn.Module):
             # Track gradient for each event type. Shape: [n_event_types, batch_size, time_stamps-1]
             event_scores = torch.zeros(self.n_event_types, batch_size, time_stamps - 1, device=device)
 
+            # Multiply event weights w.r.t. baseline by a range of numbers between 0 and 1.
+            # Then stack in ascending order:
+            #     [[inputs * 0], [inputs * 1/(steps-1)], [inputs * 2/(steps-1)], ..., [inputs * 1]]
+            # Shape: [steps * batch_size, time_steps, n_event_types+1]
+            scaled_batch = (
+                baselines.unsqueeze(dim=-1) +
+                (batch - baselines).unsqueeze(dim=-1) * torch.linspace(0, 1, steps, device=batch.device)
+            )\
+                .permute([-1, *range(batch.ndimension())])\
+                .contiguous()\
+                .view(-1, *batch.size()[1:])
+
             for k in occurred_types:
-                # Compute integrated gradients for each event type
-                # Shape: [batch_size, time_stamps-1, n_event_types+1]
-                ig = batch_integrated_gradient(
+                grads = batch_grad(
                     partial(get_attribution_target, target_type=k),
-                    batch,
-                    baselines=baselines,
-                    mask=mask.unsqueeze(-1),  # [batch_size, time_stamps-1, 1]
-                    steps=steps,
+                    scaled_batch,
+                    mask
                 )
-                event_scores[k] = ig[:, :-1].sum(-1)
+
+                # Unpack steps
+                # Shape: [steps, batch_size, time_stamps, n_event_types+1]
+                grads = grads.view(steps, batch_size, *grads.size()[1:])
+
+                # Average gradients across all steps (except the first, where inputs are all zero)
+                # Shape: [batch_size, time_stamps, n_event_types+1]
+                avg_grads = grads[1:].mean(dim=0)
+
+                # "Integrate" gradients over the difference between inputs and baseline
+                # Shape: [batch_size, time_stamps, n_event_types+1]
+                integrated_grads = (batch - baselines) * avg_grads
+
+                # For each account and timestamp (excl final timestep), sum gradients from each event type
+                event_scores[k] = integrated_grads[:, :-1].sum(-1)
 
             # Update attribution matrix with the gradient of each event type w.r.t. each event type
             in_events = batch[:, :-1, 1:]
             for b, t, k in in_events.nonzero().tolist():
-                # A[:, k] = impact of event k on all event types
+                # attr_matrix[:, k] = impact of event k on all event types
                 # event_scores[:, b, t] = gradient of each event type at the account + timestamp where event k occurred
                 # Multiply the gradient by the weight of the event k at account b + timestamp t
-                A[:, k] += (in_events[b, t, k] * event_scores[:, b, t])
+                attr_matrix[:, k] += (in_events[b, t, k] * event_scores[:, b, t])
 
             # Sum the weights for each event type across timestamps and accounts
             type_counts += batch[:, :, 1:].sum([0, 1])
 
         # Plus one to avoid division by zero
-        A /= type_counts[None, :] + 1
+        attr_matrix /= type_counts[None, :] + 1
 
-        return A.detach().cpu()
+        return attr_matrix.detach().cpu()

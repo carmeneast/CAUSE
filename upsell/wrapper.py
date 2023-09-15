@@ -46,7 +46,7 @@ class CauseWrapper:
 
         # Evaluate model on test set
         metrics = self.calculate_test_metrics(test_event_seqs)
-        self.plot_precision_at_k(metrics)
+        self.plot_avg_incidence_at_k(metrics)
 
         # Predict future event intensities on test set
         pred_event_seqs = self.load_event_seqs(dataset='pred')
@@ -183,6 +183,7 @@ class CauseWrapper:
     def plot_training_loss(self, history, tune_metric):
         plt.plot(history[f'train_{tune_metric}'], label='train')
         plt.plot(history[f'valid_{tune_metric}'], label='valid')
+        plt.title(self.tenant_id)
         plt.xlabel('epoch')
         plt.ylabel(tune_metric)
         plt.legend()
@@ -192,16 +193,18 @@ class CauseWrapper:
             plt.savefig(f'{self.tenant_id}/{self.run_date}/training_loss.png')
         plt.show()
 
-    def plot_precision_at_k(self, metrics):
+    def plot_avg_incidence_at_k(self, metrics):
         ks = self.CONFIG.model.ks
-        precisions = [metrics[f'precision_at_{k}'].avg for k in ks]
-        plt.plot(ks, precisions)
-        plt.xlabel('Intensity')
-        plt.ylabel('Precision @ Intensity')
+        incidences = [metrics[f'avg_incidence_at_{k}'].avg for k in ks]
+        plt.plot(ks, incidences)
+        plt.plot([0, max(ks)], [0, max(ks)], linestyle=':', color='black')
+        plt.title(self.tenant_id)
+        plt.xlabel('Predicted Incidence')
+        plt.ylabel('True Average Incidence')
         if self.sampling:
-            plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/precision_at_k.png')
+            plt.savefig(f'{self.tenant_id}/{self.run_date}/{self.sampling}/avg_incidence_at_k.png')
         else:
-            plt.savefig(f'{self.tenant_id}/{self.run_date}/precision_at_k.png')
+            plt.savefig(f'{self.tenant_id}/{self.run_date}/avg_incidence_at_k.png')
         plt.show()
 
     def calculate_test_metrics(self, event_seqs):

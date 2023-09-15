@@ -40,7 +40,7 @@ model:
     - 52
   max_log_basis_weight: 10
   ks:
-    - 0.0
+    - 0.001
     - 0.01
     - 0.1
     - 0.5
@@ -53,10 +53,12 @@ train:
   epochs: 150
   l2_reg: 0
   steps: 50
-  attr_batch_size: 8
-  occurred_type_only: True
   tune_metric: 'nll'
   patience: 3
+
+attribution:
+  attr_batch_size: 8
+  occurred_type_only: True
 
 predict:
   min_time_steps: 1

@@ -3,6 +3,7 @@ from typing import List, Optional, Callable
 
 import torch
 from torch.utils.data import DataLoader
+from torch import BoolTensor, LongTensor
 
 
 def split_data_loader(data_loader: DataLoader, ratio: float):
@@ -129,7 +130,7 @@ def convert_to_bucketed_data_loader(data_loader: DataLoader, key_fn: Optional[Ca
     )
 
 
-def generate_sequence_mask(lengths, device=None):
+def generate_sequence_mask(lengths: LongTensor, device: Optional = None) -> BoolTensor:
     """
     :param lengths: LongTensor (1-D)
     :param device:
