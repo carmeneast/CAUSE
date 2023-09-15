@@ -10,7 +10,8 @@ from upsell.metric_tracker import MetricTracker
 from upsell.rnn import ExplainableRecurrentPointProcess
 from upsell.utils.data_loader import split_data_loader, convert_to_bucketed_data_loader
 from upsell.utils.env import get_freer_gpu, set_rand_seed
-from upsell.utils.s3 import load_numpy_data, load_pytorch_object, save_pytorch_dataset, save_pytorch_model
+from upsell.utils.s3 import load_numpy_data, load_pytorch_object,\
+    save_pytorch_dataset, save_pytorch_model, save_attributions
 
 
 class CauseWrapper:
@@ -48,6 +49,11 @@ class CauseWrapper:
         metrics = self.calculate_test_metrics(test_event_seqs)
         self.plot_avg_incidence_at_k(metrics)
 
+        # Calculate infectivity
+        attribution_matrix = self.calculate_infectivity(train_event_seqs)
+        if attribution_matrix is not None:
+            print(attribution_matrix.shape)
+
         # Predict future event intensities on test set
         pred_event_seqs = self.load_event_seqs(dataset='pred')
         intensities, cumulants, log_basis_weights = self.predict(
@@ -78,20 +84,25 @@ class CauseWrapper:
 
         return event_seqs
 
-    def init_data_loader(self, event_seqs, dataset='train'):
+    def init_data_loader(self, event_seqs, dataset: str = 'train', attribution: bool = False):
         configs = self.CONFIG.data_loader
         data_loader_args = {
-            'batch_size': configs.batch_size,
+            'batch_size': configs.attr_batch_size if attribution else configs.batch_size,
             'collate_fn': EventSeqDataset.collate_fn,
             'num_workers': configs.num_workers,
         }
+        shuffle = (dataset == 'train') and not attribution
 
-        shuffle = (dataset == 'train')
         data_loader = DataLoader(
             EventSeqDataset(event_seqs), shuffle=shuffle, **data_loader_args
         )
 
-        if dataset == 'train':
+        if attribution:
+            bucketed_data_loader = convert_to_bucketed_data_loader(
+                data_loader, keys=[x.shape[0] for x in data_loader.dataset]
+            )
+            return bucketed_data_loader
+        elif dataset == 'train':
             train_data_loader, valid_data_loader = split_data_loader(
                 data_loader, configs.train_validation_split
             )
@@ -238,3 +249,21 @@ class CauseWrapper:
     def evaluate_event_prediction(self):
         # Function to evaluate predictions for a specific event type
         pass
+
+    def calculate_infectivity(self, event_seqs):
+        configs = self.CONFIG.attribution
+        if not configs.skip_eval_infectivity:
+            attr_data_loader = self.init_data_loader(event_seqs, attribution=True)
+            attr_matrix = self.model.get_infectivity(
+                attr_data_loader,
+                device=self.device,
+                steps=configs.steps,
+                occurred_type_only=configs.occurred_type_only
+            )
+            index = self.event_type_names['event_type'].to_list()
+            attr_df = pd.DataFrame(attr_matrix.numpy(), columns=index, index=index)
+            save_attributions(attr_df, self.bucket, self.tenant_id, self.run_date, self.sampling)
+        else:
+            print('Skipping calculate infectivity')
+            attr_matrix = None
+        return attr_matrix

@@ -20,6 +20,7 @@ data_loader:
   train_validation_split: 0.85
   bucket_seqs: True
   batch_size: 64
+  attr_batch_size: 8
   num_workers: 0
 
 model:
@@ -57,7 +58,8 @@ train:
   patience: 3
 
 attribution:
-  attr_batch_size: 8
+  skip_eval_infectivity: True
+  steps: 50
   occurred_type_only: True
 
 predict:

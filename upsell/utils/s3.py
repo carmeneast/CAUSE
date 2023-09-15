@@ -2,7 +2,7 @@ import boto3
 import torch
 import numpy as np
 import pandas as pd
-from io import BytesIO
+from io import BytesIO, StringIO
 
 
 def pd_read_s3_multiple_files(bucket, key, file_suffix='.csv', verbose=False):
@@ -96,3 +96,12 @@ def load_pytorch_object(bucket, tenant_id, run_date, sampling, name):
         data.seek(0)
         obj = torch.load(data)
     return obj
+
+
+def save_attributions(df, bucket, tenant_id, run_date, sampling=None):
+    key = s3_key(tenant_id, run_date, sampling)
+    s3_resource = boto3.resource('s3')
+    buffer = StringIO()
+    df.to_csv(buffer, index=False, escapechar='\\')
+    s3_resource.Object(bucket, key+'attributions.csv').put(Body=buffer.getvalue())
+
