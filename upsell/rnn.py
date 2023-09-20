@@ -347,8 +347,8 @@ class ExplainableRecurrentPointProcess(nn.Module):
             data_loader: DataLoader,
             device: Optional = None,
             time_steps: List[int] = range(1, 31)
-    ) -> Tuple[FloatTensor, FloatTensor, FloatTensor]:
-        batch_intensities, batch_cumulants, batch_log_basis_weights = [], [], []
+    ) -> Tuple[FloatTensor, FloatTensor]:
+        batch_intensities, batch_cumulants = [], []
         with torch.no_grad():
             for batch in tqdm(data_loader):
                 if device:
@@ -380,16 +380,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
                 batch_intensities.append(intensities)
                 batch_cumulants.append(cumulants)
-                batch_log_basis_weights.append(last_log_basis_weights)
 
         # Stack intensities and cumulants [all accounts, n_event_types, days]
         all_intensities = torch.cat(batch_intensities, dim=0)
         all_cumulants = torch.cat(batch_cumulants, dim=0)
 
-        # Stack basis weights [all accounts, n_event_types, n_bases]
-        all_log_basis_weights = torch.cat(batch_log_basis_weights, dim=0)
-
-        return all_intensities, all_cumulants, all_log_basis_weights
+        return all_intensities, all_cumulants
 
     def get_infectivity(
             self,

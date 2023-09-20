@@ -47,6 +47,11 @@ def s3_key(tenant_id, run_date, sampling=None):
         return f'upsell/{tenant_id}/{run_date}/'
 
 
+def load_event_type_names(bucket, tenant_id, run_date, sampling=None):
+    key = s3_key(tenant_id, run_date, sampling)
+    return pd_read_s3_multiple_files(bucket, key+'event_type_names/', '.parquet')
+
+
 def load_numpy_data(bucket, tenant_id, run_date, sampling=None, dataset='train'):
     key = s3_key(tenant_id, run_date, sampling)
     filename = f'{dataset}_model_data.npz'
@@ -61,14 +66,9 @@ def load_numpy_data(bucket, tenant_id, run_date, sampling=None, dataset='train')
         account_ids = data['account_ids']
         print('account_ids', account_ids.shape)
 
-    event_type_names = pd_read_s3_multiple_files(bucket, key+'event_type_names/', '.parquet')
-    n_event_types = len(event_type_names)
-    print('n_event_types', n_event_types)
     return {
         'event_seqs': event_seqs,
         'account_ids': account_ids,
-        'event_type_names': event_type_names,
-        'n_event_types': len(event_type_names),
     }
 
 
