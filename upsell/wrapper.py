@@ -2,6 +2,9 @@ import torch
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
+from ray import tune
+from ray.air import Checkpoint, session
+from ray.tune.schedulers import ASHAScheduler
 from torch.utils.data import DataLoader
 
 from upsell.configs import load_yaml_config
@@ -34,15 +37,19 @@ class CauseWrapper:
         self.n_event_types, self.event_type_names = None, None
         self.model = None
 
-    def run(self):
+    def run(self, tune_params=True):
         # Get event sequences
         train_event_seqs = self.load_event_seqs(dataset='train')
         test_event_seqs = self.load_event_seqs(dataset='test')
         train_data_loader, valid_data_loader = self.init_data_loader(train_event_seqs, dataset='train')
 
         # Train model
-        self.init_model()
-        history = self.train(train_data_loader, valid_data_loader)
+        if tune_params:
+            self.train_with_tuning(train_data_loader, valid_data_loader)
+        else:
+            self.init_model()
+            self.train(train_data_loader, valid_data_loader, tune_params=False)
+        history = pd.read_csv(f'{self.tenant_id}/{self.run_date}/history.csv')
         self.plot_training_loss(history, self.CONFIG.train.tune_metric)
 
         # Evaluate model on test set
@@ -117,11 +124,35 @@ class CauseWrapper:
         else:
             return data_loader
 
-    def init_model(self):
-        self.model = ExplainableRecurrentPointProcess(n_event_types=self.n_event_types, **{**self.CONFIG.model})
+    def init_model(self, param_space=None):
+        """
+        Initialize ExplainableRecurrentPointProcess model object
+        :param param_space: (Optional) ray-tune search space for hyperparameters
+            If not provided, use default hyperparameters
+        :return: None
+        """
+        config = self.CONFIG.model
+        if param_space is None:
+            param_space = {
+                'embedding_dim': config.embedding_dim.default,
+                'hidden_size': config.hidden_size.default,
+                'dropout': config.dropout.default,
+            }
+
+        self.model = ExplainableRecurrentPointProcess(
+            n_event_types=self.n_event_types,
+            embedding_dim=param_space['embedding_dim'],
+            hidden_size=param_space['hidden_size'],
+            rnn=config.rnn,
+            dropout=param_space['dropout'],
+            basis_type=config.basis_type,
+            basis_means=config.basis_means,
+            max_log_basis_weight=config.max_log_basis_weight,
+            ks=config.ks,
+        )
         self.model = self.model.to(self.device)
 
-    def train(self, train_data_loader, valid_data_loader):
+    def train(self, train_data_loader, valid_data_loader, tune_params=True):
         configs = self.CONFIG.train
         optimizer = getattr(torch.optim, configs.optimizer)(
             self.model.parameters(), lr=configs.lr
@@ -189,7 +220,59 @@ class CauseWrapper:
         else:
             filename = f'{self.tenant_id}/{self.run_date}/history.csv'
         history.to_csv(filename, index=False)
+
+        if tune_params:
+            checkpoint_data = {
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }
+            checkpoint = Checkpoint.from_dict(checkpoint_data)
+
+            session.report(
+                {k: v.avg for k, v in epoch_metrics['valid'].items()},
+                checkpoint=checkpoint,
+            )
+
         return history
+
+    def train_with_tuning(self, train_data_loader, valid_data_loader):
+        def __train_with_tuning(_config):
+            self.init_model(param_space=_config)
+            self.train(train_data_loader, valid_data_loader, tune_params=True)
+
+        # Create search space for hyperparameters
+        config = {
+            'dropout': tune.quniform(self.CONFIG.model.dropout.min, self.CONFIG.model.dropout.max, 0.01),
+            'embedding_dim': tune.choice([2 ** i for i in range(
+                self.CONFIG.model.embedding_dim.min_pow_2, self.CONFIG.model.embedding_dim.max_pow_2)]),
+            'hidden_size': tune.choice([2 ** i for i in range(
+                self.CONFIG.model.hidden_size.min_pow_2, self.CONFIG.model.hidden_size.max_pow_2)]),
+        }
+
+        # Test different hyperparameter combinations using AsyncHyperBand algorithm
+        scheduler = ASHAScheduler(
+            metric=self.CONFIG.train.tune_metric,
+            mode='min',
+            max_t=10,
+            grace_period=self.CONFIG.tuning.grace_period,
+            reduction_factor=self.CONFIG.tuning.reduction_factor,
+        )
+        result = tune.run(
+            __train_with_tuning,
+            resources_per_trial={'cpu': 2, 'gpu': 0},
+            config=config,
+            num_samples=self.CONFIG.tuning.n_param_combos,
+            scheduler=scheduler,
+        )
+
+        # Initialize model with best hyperparameters
+        best_trial = result.get_best_trial(self.CONFIG.train.tune_metric, 'min', 'last')
+        self.init_model(param_space=best_trial.config)
+
+        # Load weights from best trial
+        best_checkpoint_data = best_trial.checkpoint.to_air_checkpoint().to_dict()
+        self.model.load_state_dict(best_checkpoint_data['model_state_dict'])
 
     def plot_training_loss(self, history, tune_metric):
         plt.plot(history[f'train_{tune_metric}'], label='train')
@@ -209,7 +292,7 @@ class CauseWrapper:
         incidences = [metrics[f'avg_incidence_at_{k}'].avg for k in ks]
         plt.plot(ks, incidences)
         plt.plot([0, max(ks)], [0, max(ks)], linestyle=':', color='black')
-        plt.title(self.tenant_id)
+        plt.title(f'{self.tenant_id} Calibration Plot')
         plt.xlabel('Predicted Incidence')
         plt.ylabel('True Average Incidence')
         if self.sampling:
