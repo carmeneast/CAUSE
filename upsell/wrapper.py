@@ -45,10 +45,11 @@ class CauseWrapper:
 
         # Train model
         if tune_params:
-            self.train_with_tuning(train_data_loader, valid_data_loader)
+            self.train_with_tuning()
         else:
             self.init_model()
             self.train(train_data_loader, valid_data_loader, tune_params=False)
+
         history = pd.read_csv(f'{self.tenant_id}/{self.run_date}/history.csv')
         self.plot_training_loss(history, self.CONFIG.train.tune_metric)
 
@@ -236,8 +237,11 @@ class CauseWrapper:
 
         return history
 
-    def train_with_tuning(self, train_data_loader, valid_data_loader):
+    def train_with_tuning(self):
         def __train_with_tuning(_config):
+            # Get event sequences
+            train_event_seqs = self.load_event_seqs(dataset='train')
+            train_data_loader, valid_data_loader = self.init_data_loader(train_event_seqs, dataset='train')
             self.init_model(param_space=_config)
             self.train(train_data_loader, valid_data_loader, tune_params=True)
 
