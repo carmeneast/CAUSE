@@ -2,6 +2,7 @@ import torch
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
+from functools import partial
 from ray import tune
 from ray.air import Checkpoint, session
 from ray.tune.schedulers import ASHAScheduler
@@ -29,7 +30,7 @@ def init_env():
 
     event_type_names = load_event_type_names(config.bucket, config.tenant_id, config.run_date, config.sampling)
     config.model.n_event_types = event_type_names.shape[0]
-    config.attribution.event_type_names = event_type_names
+    config.attribution.event_type_names = event_type_names['event_type'].to_list()
     return device, config
 
 
@@ -254,9 +255,10 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, to
 
 
 def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
-    def __train_with_tuning(__search_space):
-        untrained_model = init_model(device, configs.model, param_space=__search_space)
-        _ = train(train_data_loader, valid_data_loader, untrained_model, device, configs.train, configs, tune_params=True)
+    def __train_with_tuning(__search_space, model_configs, train_configs):
+        untrained_model = init_model(device, model_configs, param_space=__search_space)
+        _ = train(train_data_loader, valid_data_loader, untrained_model, device, train_configs,
+                  configs, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
@@ -276,7 +278,7 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
         reduction_factor=configs.tuning.reduction_factor,
     )
     result = tune.run(
-        __train_with_tuning,
+        partial(__train_with_tuning, model_configs=configs.model, train_configs=configs.train),
         resources_per_trial={'cpu': 2, 'gpu': 0},
         config=search_space,
         num_samples=configs.tuning.n_param_combos,
@@ -309,8 +311,8 @@ def calculate_infectivity(event_seqs, model, device, loader_configs, attribution
         steps=attribution_configs.steps,
         occurred_type_only=attribution_configs.occurred_type_only
     )
-    index = attribution_configs.event_type_names['event_type'].to_list()
-    attr_df = pd.DataFrame(attr_matrix.numpy(), columns=index, index=index)
+    attr_df = pd.DataFrame(attr_matrix.numpy(), columns=attribution_configs.event_type_names,
+                           index=attribution_configs.event_type_names)
     return attr_df
 
 
