@@ -146,7 +146,7 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
 
 
 def init_model(device, model_configs):
-    if model_configs['embedding_dim']['default'] is not None:
+    if type(model_configs['embedding_dim']) != int:
         # The model configs are from config.yml and not for tuning
         model_configs['embedding_dim'] = model_configs['embedding_dim']['default']
         model_configs['hidden_size'] = model_configs['hidden_size']['default']
