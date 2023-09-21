@@ -36,15 +36,15 @@ def init_env():
 
 def run(device, configs, tune_params=True):
     # Get event sequences
-    train_event_seqs = load_event_seqs(configs, dataset='train')
-    test_event_seqs = load_event_seqs(configs, dataset='test')
+    train_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='train')
+    test_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='test')
     train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, configs.data_loader, dataset='train')
 
     # Train model
     if tune_params:
         model = train_with_tuning(train_data_loader, valid_data_loader, device, configs)
     else:
-        untrained_model = init_model(device, model_configs=configs.model)
+        untrained_model = init_model(device, configs.model)
         model = train(train_data_loader, valid_data_loader, untrained_model, device,
                       configs.tenant_id, configs.run_date, tune_params=False)
 
@@ -74,7 +74,7 @@ def run(device, configs, tune_params=True):
 
     # Predict future event intensities on test set
     model = load_pytorch_object(configs.bucket, configs.tenant_id, configs.run_date, configs.sampling, 'model')
-    pred_event_seqs = load_event_seqs(configs, dataset='pred')
+    pred_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='pred')
     intensities, cumulants = predict(
         pred_event_seqs,
         model,
@@ -99,8 +99,10 @@ def get_device(cuda: bool, dynamic: bool = False):
     return device
 
 
-def load_event_seqs(configs, dataset='train'):
-    data = load_numpy_data(configs.bucket, configs.tenant_id, configs.run_date, configs.sampling, dataset)
+def load_event_seqs(tenant_id, run_date, dataset='train'):
+    bucket = 'ceasterwood'
+    sampling = None
+    data = load_numpy_data(bucket, tenant_id, run_date, sampling, dataset)
     event_seqs = data['event_seqs']
 
     if dataset == 'test':
@@ -112,9 +114,9 @@ def load_event_seqs(configs, dataset='train'):
 
 def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribution: bool = False):
     data_loader_args = {
-        'batch_size': loader_configs.attr_batch_size if attribution else loader_configs.batch_size,
+        'batch_size': loader_configs['attr_batch_size'] if attribution else loader_configs['batch_size'],
         'collate_fn': EventSeqDataset.collate_fn,
-        'num_workers': loader_configs.num_workers,
+        'num_workers': loader_configs['num_workers'],
     }
     shuffle = (dataset == 'train') and not attribution
 
@@ -129,9 +131,9 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
         return bucketed_data_loader
     elif dataset == 'train':
         train_data_loader, valid_data_loader = split_data_loader(
-            data_loader, loader_configs.train_validation_split
+            data_loader, loader_configs['train_validation_split']
         )
-        if loader_configs.bucket_seqs:
+        if loader_configs['bucket_seqs']:
             train_data_loader = convert_to_bucketed_data_loader(
                 train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset]
             )
@@ -143,40 +145,23 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
         return data_loader
 
 
-def init_model(device, param_space=None, model_configs=None):
-    """
-    Initialize ExplainableRecurrentPointProcess model object
-    :param device: torch device object
-    :param param_space: (Optional) ray-tune search space for hyperparameters
-        If not provided, use default hyperparameters
-    :param model_configs: (Optional) model configurations
-    :return: None
-    """
-    assert param_space is not None or model_configs is not None, \
-        'Must provide either param_space or model_configs'
-    if param_space is None:
-        param_space = {
-            'n_event_types': model_configs.n_event_types,
-            'embedding_dim': model_configs.embedding_dim.default,
-            'hidden_size': model_configs.hidden_size.default,
-            'rnn': model_configs.rnn,
-            'dropout': model_configs.dropout.default,
-            'basis_type': model_configs.basis_type,
-            'basis_means': model_configs.basis_means,
-            'max_log_basis_weight': model_configs.max_log_basis_weight,
-            'ks': model_configs.ks,
-        }
+def init_model(device, model_configs):
+    if model_configs['embedding_dim']['default'] is not None:
+        # The model configs are from config.yml and not for tuning
+        model_configs['embedding_dim'] = model_configs['embedding_dim']['default']
+        model_configs['hidden_size'] = model_configs['hidden_size']['default']
+        model_configs['dropout'] = model_configs['dropout']['default']
 
     model = ExplainableRecurrentPointProcess(
-        n_event_types=param_space['n_event_types'],
-        embedding_dim=param_space['embedding_dim'],
-        hidden_size=param_space['hidden_size'],
-        rnn=param_space['rnn'],
-        dropout=param_space['dropout'],
-        basis_type=param_space['basis_type'],
-        basis_means=param_space['basis_means'],
-        max_log_basis_weight=param_space['max_log_basis_weight'],
-        ks=param_space['ks'],
+        n_event_types=model_configs['n_event_types'],
+        embedding_dim=model_configs['embedding_dim'],
+        hidden_size=model_configs['hidden_size'],
+        rnn=model_configs['rnn'],
+        dropout=model_configs['dropout'],
+        basis_type=model_configs['basis_type'],
+        basis_means=model_configs['basis_means'],
+        max_log_basis_weight=model_configs['max_log_basis_weight'],
+        ks=model_configs['ks'],
     )
     model = model.to(device)
     return model
@@ -264,14 +249,23 @@ def train(train_data_loader, valid_data_loader, model, device, tenant_id, run_da
     return model
 
 
-def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
+def train_with_tuning(device, configs):
     def __train_with_tuning(__search_space, tenant_id, run_date):
-        untrained_model = init_model(device, param_space=__search_space)
+        train_event_seqs = load_event_seqs(tenant_id, run_date, dataset='train')
+        train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, __search_space, dataset='train')
+        untrained_model = init_model(device, __search_space)
         _ = train(train_data_loader, valid_data_loader, untrained_model, device,
                   tenant_id, run_date, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
+        # Data loader params
+        'train_validation_split': configs.data_loader.train_validation_split,
+        'bucket_seqs': configs.data_loader.bucket_seqs,
+        'batch_size': configs.data_loader.batch_size,
+        'attr_batch_size': configs.data_loader.attr_batch_size,
+        'num_workers': configs.data_loader.num_workers,
+
         # Model params
         'n_event_types': configs.model.n_event_types,
         'embedding_dim': tune.choice([2 ** i for i in range(
@@ -286,12 +280,12 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
         'ks': configs.model.ks,
 
         # Training params
-        # 'optimizer': configs.train.optimizer,
-        # 'lr': configs.train.lr,
-        # 'epochs': configs.train.epochs,
-        # 'l2_reg': configs.train.l2_reg,
-        # 'tune_metric': configs.train.tune_metric,
-        # 'patience': configs.train.patience,
+        'optimizer': configs.train.optimizer,
+        'lr': configs.train.lr,
+        'epochs': configs.train.epochs,
+        'l2_reg': configs.train.l2_reg,
+        'tune_metric': configs.train.tune_metric,
+        'patience': configs.train.patience,
     }
 
     # Test different hyperparameter combinations using AsyncHyperBand algorithm
@@ -312,7 +306,7 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
 
     # Initialize model with best hyperparameters
     best_trial = result.get_best_trial(configs.train.tune_metric, 'min', 'last')
-    best_model = init_model(device, param_space=best_trial.config)
+    best_model = init_model(device, best_trial.config)
 
     # Load weights from best trial
     best_checkpoint_data = best_trial.checkpoint.to_air_checkpoint().to_dict()
