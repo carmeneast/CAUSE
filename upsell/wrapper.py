@@ -42,10 +42,10 @@ def run(device, configs, tune_params=True):
 
     # Train model
     if tune_params:
-        model = train_with_tuning(train_data_loader, valid_data_loader, device, configs)
+        model = train_with_tuning(device, configs)
     else:
         untrained_model = init_model(device, configs.model)
-        model = train(train_data_loader, valid_data_loader, untrained_model, device,
+        model = train(train_data_loader, valid_data_loader, untrained_model, device, configs.train,
                       configs.tenant_id, configs.run_date, tune_params=False)
 
     # Evaluate training history
@@ -167,13 +167,12 @@ def init_model(device, model_configs):
     return model
 
 
-def train(train_data_loader, valid_data_loader, model, device, tenant_id, run_date, tune_params=True):
+def train(train_data_loader, valid_data_loader, model, device, train_configs, tenant_id, run_date, tune_params=True):
     bucket = 'ceasterwood'
     sampling = None
-    train_configs = load_yaml_config('upsell/config.yml').train
 
-    optimizer = getattr(torch.optim, train_configs.optimizer)(
-        model.parameters(), lr=train_configs.lr
+    optimizer = getattr(torch.optim, train_configs['optimizer'])(
+        model.parameters(), lr=train_configs['lr']
     )
 
     model.train()
@@ -186,7 +185,7 @@ def train(train_data_loader, valid_data_loader, model, device, tenant_id, run_da
         for loss_type in ['train', 'valid']
     }
     dt = []
-    for epoch in range(train_configs.epochs):
+    for epoch in range(train_configs['epochs']):
         start = datetime.now()
         print(f'Epoch {epoch}: {start}')
         train_metrics, valid_metrics = model.train_epoch(
@@ -194,7 +193,7 @@ def train(train_data_loader, valid_data_loader, model, device, tenant_id, run_da
             optimizer,
             valid_data_loader,
             device=device,
-            l2_reg=train_configs.l2_reg,
+            l2_reg=train_configs['l2_reg'],
         )
         # Store training and validation metrics for this epoch
         for loss_type in ['train', 'valid']:
@@ -206,19 +205,20 @@ def train(train_data_loader, valid_data_loader, model, device, tenant_id, run_da
         end = datetime.now()
         dt.append((end - start).total_seconds())
 
-        msg = f'[Training] Epoch={epoch} {train_configs.tune_metric}={train_metrics[train_configs.tune_metric].avg:.4f}'
+        tune_metric = train_configs['tune_metric']
+        msg = f'[Training] Epoch={epoch} {tune_metric}={train_metrics[tune_metric].avg:.4f}'
         print(msg)  # logger.info(msg)
-        msg = f'[Validation] Epoch={epoch} {train_configs.tune_metric}={valid_metrics[train_configs.tune_metric].avg:.4f}'
+        msg = f'[Validation] Epoch={epoch} {tune_metric}={valid_metrics[tune_metric].avg:.4f}'
         print(msg)  # logger.info(msg)
 
-        if valid_metrics[train_configs.tune_metric].avg < best_metric:
+        if valid_metrics[tune_metric].avg < best_metric:
             best_epoch = epoch
-            best_metric = valid_metrics[train_configs.tune_metric].avg
+            best_metric = valid_metrics[tune_metric].avg
             save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
 
-        if epoch - best_epoch >= train_configs.patience:
+        if epoch - best_epoch >= train_configs['patience']:
             print(f'Stopped training early at epoch {epoch}: ' +
-                  f'Failed to improve validation {train_configs.tune_metric} in last {train_configs.patience} epochs')
+                  f'Failed to improve validation {tune_metric} in last {train_configs["patience"]} epochs')
             break
 
     # Reset model to the last-saved (best) version of the model
@@ -254,7 +254,7 @@ def train_with_tuning(device, configs):
         train_event_seqs = load_event_seqs(tenant_id, run_date, dataset='train')
         train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, __search_space, dataset='train')
         untrained_model = init_model(device, __search_space)
-        _ = train(train_data_loader, valid_data_loader, untrained_model, device,
+        _ = train(train_data_loader, valid_data_loader, untrained_model, device, __search_space,
                   tenant_id, run_date, tune_params=True)
 
     # Create search space for hyperparameters
