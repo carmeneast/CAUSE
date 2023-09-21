@@ -44,9 +44,9 @@ def run(device, configs, tune_params=True):
     if tune_params:
         model = train_with_tuning(train_data_loader, valid_data_loader, device, configs)
     else:
-        untrained_model = init_model(device, model_configs=configs.model)
+        untrained_model = init_model(device)
         model = train(train_data_loader, valid_data_loader, untrained_model, device,
-                      train_configs=configs.train, top_level_configs=configs, tune_params=False)
+                      configs.tenant_id, configs.run_date, tune_params=False)
 
     # Evaluate training history
     history = pd.read_csv(f'{configs.tenant_id}/{configs.run_date}/history.csv')
@@ -143,15 +143,15 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
         return data_loader
 
 
-def init_model(device, model_configs, param_space=None):
+def init_model(device, param_space=None):
     """
     Initialize ExplainableRecurrentPointProcess model object
     :param device: torch device object
-    :param model_configs: model configs
     :param param_space: (Optional) ray-tune search space for hyperparameters
         If not provided, use default hyperparameters
     :return: None
     """
+    model_configs = load_yaml_config('upsell/config.yml').model
     if param_space is None:
         param_space = {
             'embedding_dim': model_configs.embedding_dim.default,
@@ -174,7 +174,11 @@ def init_model(device, model_configs, param_space=None):
     return model
 
 
-def train(train_data_loader, valid_data_loader, model, device, train_configs, top_level_configs, tune_params=True):
+def train(train_data_loader, valid_data_loader, model, device, tenant_id, run_date, tune_params=True):
+    bucket = 'ceasterwood'
+    sampling = None
+    train_configs = load_yaml_config('upsell/config.yml').train
+
     optimizer = getattr(torch.optim, train_configs.optimizer)(
         model.parameters(), lr=train_configs.lr
     )
@@ -217,8 +221,7 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, to
         if valid_metrics[train_configs.tune_metric].avg < best_metric:
             best_epoch = epoch
             best_metric = valid_metrics[train_configs.tune_metric].avg
-            save_pytorch_model(model, top_level_configs.bucket, top_level_configs.tenant_id,
-                               top_level_configs.run_date, top_level_configs.sampling)
+            save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
 
         if epoch - best_epoch >= train_configs.patience:
             print(f'Stopped training early at epoch {epoch}: ' +
@@ -226,8 +229,7 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, to
             break
 
     # Reset model to the last-saved (best) version of the model
-    model = load_pytorch_object(top_level_configs.bucket, top_level_configs.tenant_id,
-                                top_level_configs.run_date, top_level_configs.sampling, 'model')
+    model = load_pytorch_object(bucket, tenant_id, run_date, sampling, 'model')
 
     # Save training history
     history = pd.DataFrame({
@@ -255,10 +257,10 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, to
 
 
 def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
-    def __train_with_tuning(__search_space, model_configs, train_configs):
-        untrained_model = init_model(device, model_configs, param_space=__search_space)
-        _ = train(train_data_loader, valid_data_loader, untrained_model, device, train_configs,
-                  configs, tune_params=True)
+    def __train_with_tuning(__search_space):
+        untrained_model = init_model(device, param_space=__search_space)
+        _ = train(train_data_loader, valid_data_loader, untrained_model, device,
+                  configs.tenant_id, configs.run_date, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
@@ -278,7 +280,7 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
         reduction_factor=configs.tuning.reduction_factor,
     )
     result = tune.run(
-        partial(__train_with_tuning, model_configs=configs.model, train_configs=configs.train),
+        __train_with_tuning,
         resources_per_trial={'cpu': 2, 'gpu': 0},
         config=search_space,
         num_samples=configs.tuning.n_param_combos,
@@ -287,7 +289,7 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
 
     # Initialize model with best hyperparameters
     best_trial = result.get_best_trial(configs.train.tune_metric, 'min', 'last')
-    best_model = init_model(device, configs.model, param_space=best_trial.config)
+    best_model = init_model(device, param_space=best_trial.config)
 
     # Load weights from best trial
     best_checkpoint_data = best_trial.checkpoint.to_air_checkpoint().to_dict()
