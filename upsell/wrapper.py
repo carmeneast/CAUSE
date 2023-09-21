@@ -44,7 +44,7 @@ def run(device, configs, tune_params=True):
     if tune_params:
         model = train_with_tuning(train_data_loader, valid_data_loader, device, configs)
     else:
-        untrained_model = init_model(device)
+        untrained_model = init_model(device, model_configs=configs.model)
         model = train(train_data_loader, valid_data_loader, untrained_model, device,
                       configs.tenant_id, configs.run_date, tune_params=False)
 
@@ -143,32 +143,40 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
         return data_loader
 
 
-def init_model(device, param_space=None):
+def init_model(device, param_space=None, model_configs=None):
     """
     Initialize ExplainableRecurrentPointProcess model object
     :param device: torch device object
     :param param_space: (Optional) ray-tune search space for hyperparameters
         If not provided, use default hyperparameters
+    :param model_configs: (Optional) model configurations
     :return: None
     """
-    model_configs = load_yaml_config('upsell/config.yml').model
+    assert param_space is not None or model_configs is not None, \
+        'Must provide either param_space or model_configs'
     if param_space is None:
         param_space = {
+            'n_event_types': model_configs.n_event_types,
             'embedding_dim': model_configs.embedding_dim.default,
             'hidden_size': model_configs.hidden_size.default,
+            'rnn': model_configs.rnn,
             'dropout': model_configs.dropout.default,
+            'basis_type': model_configs.basis_type,
+            'basis_means': model_configs.basis_means,
+            'max_log_basis_weight': model_configs.max_log_basis_weight,
+            'ks': model_configs.ks,
         }
 
     model = ExplainableRecurrentPointProcess(
-        n_event_types=model_configs.n_event_types,
+        n_event_types=param_space['n_event_types'],
         embedding_dim=param_space['embedding_dim'],
         hidden_size=param_space['hidden_size'],
-        rnn=model_configs.rnn,
+        rnn=param_space['rnn'],
         dropout=param_space['dropout'],
-        basis_type=model_configs.basis_type,
-        basis_means=model_configs.basis_means,
-        max_log_basis_weight=model_configs.max_log_basis_weight,
-        ks=model_configs.ks,
+        basis_type=param_space['basis_type'],
+        basis_means=param_space['basis_means'],
+        max_log_basis_weight=param_space['max_log_basis_weight'],
+        ks=param_space['ks'],
     )
     model = model.to(device)
     return model
@@ -264,11 +272,17 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
 
     # Create search space for hyperparameters
     search_space = {
-        'dropout': tune.quniform(configs.model.dropout.min, configs.model.dropout.max, 0.01),
+        'n_event_types': configs.model.n_event_types,
         'embedding_dim': tune.choice([2 ** i for i in range(
             configs.model.embedding_dim.min_pow_2, configs.model.embedding_dim.max_pow_2)]),
         'hidden_size': tune.choice([2 ** i for i in range(
             configs.model.hidden_size.min_pow_2, configs.model.hidden_size.max_pow_2)]),
+        'rnn': configs.model.rnn,
+        'dropout': tune.quniform(configs.model.dropout.min, configs.model.dropout.max, 0.01),
+        'basis_type': configs.model.basis_type,
+        'basis_means': configs.model.basis_means,
+        'max_log_basis_weight': configs.model.max_log_basis_weight,
+        'ks': configs.model.ks,
     }
 
     # Test different hyperparameter combinations using AsyncHyperBand algorithm
