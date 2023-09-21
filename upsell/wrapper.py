@@ -265,13 +265,14 @@ def train(train_data_loader, valid_data_loader, model, device, tenant_id, run_da
 
 
 def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
-    def __train_with_tuning(__search_space):
+    def __train_with_tuning(__search_space, tenant_id, run_date):
         untrained_model = init_model(device, param_space=__search_space)
         _ = train(train_data_loader, valid_data_loader, untrained_model, device,
-                  configs.tenant_id, configs.run_date, tune_params=True)
+                  tenant_id, run_date, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
+        # Model params
         'n_event_types': configs.model.n_event_types,
         'embedding_dim': tune.choice([2 ** i for i in range(
             configs.model.embedding_dim.min_pow_2, configs.model.embedding_dim.max_pow_2)]),
@@ -283,6 +284,14 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
         'basis_means': configs.model.basis_means,
         'max_log_basis_weight': configs.model.max_log_basis_weight,
         'ks': configs.model.ks,
+
+        # Training params
+        # 'optimizer': configs.train.optimizer,
+        # 'lr': configs.train.lr,
+        # 'epochs': configs.train.epochs,
+        # 'l2_reg': configs.train.l2_reg,
+        # 'tune_metric': configs.train.tune_metric,
+        # 'patience': configs.train.patience,
     }
 
     # Test different hyperparameter combinations using AsyncHyperBand algorithm
@@ -294,7 +303,7 @@ def train_with_tuning(train_data_loader, valid_data_loader, device, configs):
         reduction_factor=configs.tuning.reduction_factor,
     )
     result = tune.run(
-        __train_with_tuning,
+        partial(__train_with_tuning, tenant_id=configs.tenant_id, run_date=configs.run_date),
         resources_per_trial={'cpu': 2, 'gpu': 0},
         config=search_space,
         num_samples=configs.tuning.n_param_combos,
