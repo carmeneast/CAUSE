@@ -37,7 +37,6 @@ def init_env():
 def run(device, configs, tune_params=True):
     # Get event sequences
     train_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='train')
-    test_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='test')
     train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, configs.data_loader, dataset='train')
 
     # Train model
@@ -47,6 +46,7 @@ def run(device, configs, tune_params=True):
         untrained_model = init_model(device, configs.model)
         model = train(train_data_loader, valid_data_loader, untrained_model, device, configs.train,
                       configs.tenant_id, configs.run_date, tune_params=False)
+        save_pytorch_model(model, 'ceasterwood', configs.tenant_id, configs.run_date, None)
 
     # Evaluate training history
     history = pd.read_csv(f'{configs.tenant_id}/{configs.run_date}/history.csv')
@@ -54,6 +54,7 @@ def run(device, configs, tune_params=True):
                        filepath=f'{configs.tenant_id}/{configs.run_date}/training_loss.png')
 
     # Evaluate model on test set
+    test_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='test')
     metrics = calculate_test_metrics(test_event_seqs, model, device, loader_configs=configs.data_loader)
     pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
         .to_json(f'{configs.tenant_id}/{configs.run_date}/test_metrics.json')
@@ -113,6 +114,10 @@ def load_event_seqs(tenant_id, run_date, dataset='train'):
 
 
 def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribution: bool = False):
+    if not attribution and type(loader_configs['batch_size']) != int:
+        # The train configs are from config.yml and not for tuning
+        loader_configs['batch_size'] = loader_configs['batch_size']['default']
+
     data_loader_args = {
         'batch_size': loader_configs['attr_batch_size'] if attribution else loader_configs['batch_size'],
         'collate_fn': EventSeqDataset.collate_fn,
@@ -171,6 +176,10 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
     bucket = 'ceasterwood'
     sampling = None
 
+    if type(train_configs['lr']) != float:
+        # The train configs are from config.yml and not for tuning
+        train_configs['lr'] = train_configs['lr']['default']
+
     optimizer = getattr(torch.optim, train_configs['optimizer'])(
         model.parameters(), lr=train_configs['lr']
     )
@@ -199,7 +208,7 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
         for loss_type in ['train', 'valid']:
             for metric in model.metrics:
                 epoch_metrics[loss_type][metric].update(
-                    eval(f'{loss_type}_metrics')[metric].avg.item(),
+                    eval(f'{loss_type}_metrics')[metric].avg,
                     n=eval(f'{loss_type}_metrics')[metric].count,
                 )
         end = datetime.now()
@@ -214,15 +223,17 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
         if valid_metrics[tune_metric].avg < best_metric:
             best_epoch = epoch
             best_metric = valid_metrics[tune_metric].avg
-            save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
+            if not tune_params:
+                save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
 
         if epoch - best_epoch >= train_configs['patience']:
             print(f'Stopped training early at epoch {epoch}: ' +
                   f'Failed to improve validation {tune_metric} in last {train_configs["patience"]} epochs')
             break
 
-    # Reset model to the last-saved (best) version of the model
-    model = load_pytorch_object(bucket, tenant_id, run_date, sampling, 'model')
+    if not tune_params:
+        # Reset model to the last-saved (best) version of the model
+        model = load_pytorch_object(bucket, tenant_id, run_date, sampling, 'model')
 
     # Save training history
     history = pd.DataFrame({
@@ -236,6 +247,7 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
     if tune_params:
         checkpoint_data = {
             'epoch': epoch,
+            'history': history,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
         }
@@ -245,6 +257,8 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
             {k: v.avg for k, v in epoch_metrics['valid'].items()},
             checkpoint=checkpoint,
         )
+    else:
+        history.to_csv(f'{tenant_id}/{run_date}/history.csv', index=False)
 
     return model
 
@@ -252,40 +266,42 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
 def train_with_tuning(device, configs):
     def __train_with_tuning(__search_space, tenant_id, run_date):
         train_event_seqs = load_event_seqs(tenant_id, run_date, dataset='train')
-        train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, __search_space, dataset='train')
-        untrained_model = init_model(device, __search_space)
-        _ = train(train_data_loader, valid_data_loader, untrained_model, device, __search_space,
+        train_data_loader, valid_data_loader = init_data_loader(
+            train_event_seqs, __search_space['data_loader'], dataset='train')
+        untrained_model = init_model(device, __search_space['model'])
+        _ = train(train_data_loader, valid_data_loader, untrained_model, device, __search_space['train'],
                   tenant_id, run_date, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
-        # Data loader params
-        'train_validation_split': configs.data_loader.train_validation_split,
-        'bucket_seqs': configs.data_loader.bucket_seqs,
-        'batch_size': configs.data_loader.batch_size,
-        'attr_batch_size': configs.data_loader.attr_batch_size,
-        'num_workers': configs.data_loader.num_workers,
-
-        # Model params
-        'n_event_types': configs.model.n_event_types,
-        'embedding_dim': tune.choice([2 ** i for i in range(
-            configs.model.embedding_dim.min_pow_2, configs.model.embedding_dim.max_pow_2)]),
-        'hidden_size': tune.choice([2 ** i for i in range(
-            configs.model.hidden_size.min_pow_2, configs.model.hidden_size.max_pow_2)]),
-        'rnn': configs.model.rnn,
-        'dropout': tune.quniform(configs.model.dropout.min, configs.model.dropout.max, 0.01),
-        'basis_type': configs.model.basis_type,
-        'basis_means': configs.model.basis_means,
-        'max_log_basis_weight': configs.model.max_log_basis_weight,
-        'ks': configs.model.ks,
-
-        # Training params
-        'optimizer': configs.train.optimizer,
-        'lr': configs.train.lr,
-        'epochs': configs.train.epochs,
-        'l2_reg': configs.train.l2_reg,
-        'tune_metric': configs.train.tune_metric,
-        'patience': configs.train.patience,
+        'data_loader': {
+            'train_validation_split': configs.data_loader.train_validation_split,
+            'bucket_seqs': configs.data_loader.bucket_seqs,
+            'batch_size': tune.choice([2 ** i for i in range(
+                configs.data_loader.batch_size.min_pow_2, configs.data_loader.batch_size.max_pow_2)]),
+            'num_workers': configs.data_loader.num_workers,
+        },
+        'model': {
+            'n_event_types': configs.model.n_event_types,
+            'embedding_dim': tune.choice([2 ** i for i in range(
+                configs.model.embedding_dim.min_pow_2, configs.model.embedding_dim.max_pow_2)]),
+            'hidden_size': tune.choice([2 ** i for i in range(
+                configs.model.hidden_size.min_pow_2, configs.model.hidden_size.max_pow_2)]),
+            'rnn': configs.model.rnn,
+            'dropout': tune.quniform(configs.model.dropout.min, configs.model.dropout.max, 0.01),
+            'basis_type': configs.model.basis_type,
+            'basis_means': configs.model.basis_means,
+            'max_log_basis_weight': configs.model.max_log_basis_weight,
+            'ks': configs.model.ks,
+        },
+        'train': {
+            'optimizer': configs.train.optimizer,
+            'lr': tune.qloguniform(configs.train.lr.min, configs.train.lr.max, 1.e-5),
+            'epochs': configs.train.epochs,
+            'l2_reg': configs.train.l2_reg,
+            'tune_metric': configs.train.tune_metric,
+            'patience': configs.train.patience,
+        }
     }
 
     # Test different hyperparameter combinations using AsyncHyperBand algorithm

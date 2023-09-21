@@ -20,17 +20,20 @@ preprocessing:
 data_loader:
   train_validation_split: 0.85
   bucket_seqs: True
-  batch_size: 64
+  batch_size:
+    min_pow_2: 5  # 32
+    max_pow_2: 8  # 256
+    default: 64
   attr_batch_size: 8
   num_workers: 0
 
 model:
-  embedding_dim:
+  embedding_dim:  # length of embeddings at each time step
     min_pow_2: 4  # 16
     max_pow_2: 8  # 256
     default: 64
-  hidden_size:
-    min_pow_2: 6  # 64
+  hidden_size:  # length of full embedding history
+    min_pow_2: 5  # 32
     max_pow_2: 9  # 512
     default: 128
   rnn: 'GRU'
@@ -60,16 +63,19 @@ model:
 
 train:
   optimizer: 'Adam'
-  lr: 0.001
-  epochs: 150
+  lr:
+    min: 1.e-5
+    max: 1.e-1
+    default: 1.e-3
+  epochs: 100
   l2_reg: 0
   tune_metric: 'nll'
   patience: 3
 
 tuning:
-  grace_period: 1
+  grace_period: 2
   reduction_factor: 2
-  n_param_combos: 10
+  n_param_combos: 30
 
 attribution:
   skip_eval_infectivity: True
