@@ -173,7 +173,8 @@ def init_model(model_configs, device=None):
     return model
 
 
-def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date, device=None, tune_params=True):
+def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date,
+          device=None, tune_params=True):
     bucket = 'ceasterwood'
     sampling = None
     if device is None:
@@ -194,22 +195,23 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
     if checkpoint:
         checkpoint_state = checkpoint.to_dict()
         start_epoch = checkpoint_state['epoch']
-        # history = checkpoint_state['history']
+        best_epoch = checkpoint_state['epoch']
+        best_metric = checkpoint_state['history'][f'valid_{train_configs["tune_metric"]}'].to_list()[-1]
+        history = checkpoint_state['history']
         model.load_state_dict(checkpoint_state['model_state_dict'])
         optimizer.load_state_dict(checkpoint_state['optimizer_state_dict'])
     else:
         start_epoch = 0
+        best_epoch = 0
+        best_metric = float('inf')
+        history = pd.DataFrame()
 
     model.train()
-
-    best_metric = float('inf')
-    best_epoch = 0
 
     epoch_metrics = {
         loss_type: {metric: MetricTracker(metric=metric) for metric in model.metrics}
         for loss_type in ['train', 'valid']
     }
-    dt = []
     for epoch in range(start_epoch, train_configs['epochs']):
         start = datetime.now()
         print(f'Epoch {epoch}: {start}')
@@ -229,7 +231,17 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
                     val = val.item()
                 epoch_metrics[loss_type][metric].update(val, n=n)
         end = datetime.now()
-        dt.append((end - start).total_seconds())
+
+        # Add epoch metrics to history
+        history = pd.concat([
+            history,
+            pd.DataFrame({
+                'epoch': [epoch],
+                'dt': [(end - start).total_seconds()],
+                **{f'{loss_type}_{metric}': [epoch_metrics[loss_type][metric].avg]
+                   for loss_type in ['train', 'valid'] for metric in model.metrics}
+            })
+        ]).reset_index(drop=True)
 
         tune_metric = train_configs['tune_metric']
         msg = f'[Training] Epoch={epoch} {tune_metric}={train_metrics[tune_metric].avg:.4f}'
@@ -243,6 +255,7 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
             if tune_params:
                 checkpoint_data = {
                     'epoch': epoch,
+                    'history': history,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
@@ -264,14 +277,6 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
         model = load_pytorch_object(bucket, tenant_id, run_date, sampling, 'model')
 
         # Save training history
-        history = pd.DataFrame({
-            'epoch': range(epoch + 1),
-            'dt': dt,
-        })
-        for loss_type in ['train', 'valid']:
-            for metric in model.metrics:
-                history[f'{loss_type}_{metric}'] = epoch_metrics[loss_type][metric].values
-
         history.to_csv(f'{tenant_id}/{run_date}/history.csv', index=False)
 
     return model
@@ -344,6 +349,8 @@ def train_with_tuning(device, config):
     # Load weights from best trial
     best_checkpoint_data = best_trial.checkpoint.to_air_checkpoint().to_dict()
     best_model.load_state_dict(best_checkpoint_data['model_state_dict'])
+
+    save_pytorch_model(best_model, config.bucket, config.tenant_id, config.run_date, config.sampling)
     return best_model
 
 
