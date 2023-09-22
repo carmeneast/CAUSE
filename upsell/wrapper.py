@@ -37,12 +37,12 @@ def init_env(tenant_id, run_date, bucket='ceasterwood', sampling=None):
 def run(device, config, tune_params=True):
     # Get event sequences
     train_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='train')
-    train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, config.data_loader, dataset='train')
 
     # Train model
     if tune_params:
         model = train_with_tuning(device, config)
     else:
+        train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, config.data_loader, dataset='train')
         untrained_model = init_model(config.model, device=device)
         model = train(train_data_loader, valid_data_loader, untrained_model, config.train,
                       config.tenant_id, config.run_date, device=device, tune_params=False)
@@ -74,7 +74,6 @@ def run(device, config, tune_params=True):
         print(attribution_matrix.shape)
 
     # Predict future event intensities on test set
-    model = load_pytorch_object(config.bucket, config.tenant_id, config.run_date, config.sampling, 'model')
     pred_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='pred')
     intensities, cumulants = predict(
         pred_event_seqs,
