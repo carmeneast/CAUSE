@@ -18,15 +18,15 @@ from upsell.utils.s3 import load_event_type_names, load_numpy_data, load_pytorch
     save_pytorch_dataset, save_pytorch_model, save_attributions
 
 
-def init_env():
+def init_env(tenant_id, run_date, bucket='ceasterwood', sampling=None):
     config = load_yaml_config('upsell/config.yml')
     set_rand_seed(config.env.seed, config.env.cuda)
     device = get_device(cuda=config.env.cuda)
 
-    config.tenant_id = 1309
-    config.run_date = '2023-07-01'
-    config.bucket = 'ceasterwood'
-    config.sampling = None
+    config.tenant_id = tenant_id
+    config.run_date = run_date
+    config.bucket = bucket
+    config.sampling = sampling
 
     event_type_names = load_event_type_names(config.bucket, config.tenant_id, config.run_date, config.sampling)
     config.model.n_event_types = event_type_names.shape[0]
@@ -62,7 +62,7 @@ def run(device, config, tune_params=True):
                             filepath=f'{config.tenant_id}/{config.run_date}/avg_incidence_at_k.png')
 
     # Calculate infectivity
-    if not config.skip_eval_infectivity:
+    if not config.attribution.skip_eval_infectivity:
         attribution_matrix = calculate_infectivity(
             train_event_seqs,
             model,
@@ -350,7 +350,10 @@ def train_with_tuning(device, config):
     best_checkpoint_data = best_trial.checkpoint.to_air_checkpoint().to_dict()
     best_model.load_state_dict(best_checkpoint_data['model_state_dict'])
 
+    # Save results from best trial
     save_pytorch_model(best_model, config.bucket, config.tenant_id, config.run_date, config.sampling)
+    best_checkpoint_data['history'].to_csv(f'{config.tenant_id}/{config.run_date}/history.csv', index=False)
+
     return best_model
 
 
@@ -406,5 +409,5 @@ def predict(event_seqs, model, device, loader_configs, time_steps=range(1, 5)):
 
 
 if __name__ == '__main__':
-    DEVICE, CONFIG = init_env()
+    DEVICE, CONFIG = init_env(1309, '2023-07-01')
     run(DEVICE, CONFIG, tune_params=True)
