@@ -73,9 +73,9 @@ train:
   patience: 3
 
 tuning:
-  max_training_iterations: 10
-  grace_period: 2
-  reduction_factor: 2
+  max_training_iterations: 100  # max number of epochs to train any model
+  grace_period: 2  # min number of epochs to train any model
+  reduction_factor: 2  # for HyperBand algorithm
   n_param_combos: 30
 
 attribution:

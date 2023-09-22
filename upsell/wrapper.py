@@ -248,28 +248,30 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
         msg = f'[Validation] Epoch={epoch} {tune_metric}={valid_metrics[tune_metric].avg:.4f}'
         print(msg)  # logger.info(msg)
 
-        if valid_metrics[tune_metric].avg < best_metric:
-            best_epoch = epoch
-            best_metric = valid_metrics[tune_metric].avg
-            if tune_params:
-                checkpoint_data = {
-                    'epoch': epoch,
-                    'history': history,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }
-                checkpoint = Checkpoint.from_dict(checkpoint_data)
-                session.report(
-                    {k: v.avg for k, v in epoch_metrics['valid'].items()},
-                    checkpoint=checkpoint,
-                )
-            else:
+        if tune_params:
+            # Report metrics to Ray Tune. The scheduler will determine if training should stop early.
+            checkpoint_data = {
+                'epoch': epoch,
+                'history': history,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }
+            checkpoint = Checkpoint.from_dict(checkpoint_data)
+            session.report(
+                {k: v.avg for k, v in epoch_metrics['valid'].items()},
+                checkpoint=checkpoint,
+            )
+        else:
+            # Manually determine if training should stop early
+            if valid_metrics[tune_metric].avg < best_metric:
+                best_epoch = epoch
+                best_metric = valid_metrics[tune_metric].avg
                 save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
 
-        if epoch - best_epoch >= train_configs['patience']:
-            print(f'Stopped training early at epoch {epoch}: ' +
-                  f'Failed to improve validation {tune_metric} in last {train_configs["patience"]} epochs')
-            break
+            if epoch - best_epoch >= train_configs['patience']:
+                print(f'Stopped training early at epoch {epoch}: ' +
+                      f'Failed to improve validation {tune_metric} in last {train_configs["patience"]} epochs')
+                break
 
     if not tune_params:
         # Reset model to the last-saved (best) version of the model
