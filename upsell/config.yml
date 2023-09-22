@@ -73,6 +73,7 @@ train:
   patience: 3
 
 tuning:
+  max_training_iterations: 10
   grace_period: 2
   reduction_factor: 2
   n_param_combos: 30

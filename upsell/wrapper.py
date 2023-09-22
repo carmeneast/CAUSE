@@ -34,59 +34,59 @@ def init_env():
     return device, config
 
 
-def run(device, configs, tune_params=True):
+def run(device, config, tune_params=True):
     # Get event sequences
-    train_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='train')
-    train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, configs.data_loader, dataset='train')
+    train_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='train')
+    train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, config.data_loader, dataset='train')
 
     # Train model
     if tune_params:
-        model = train_with_tuning(device, configs)
+        model = train_with_tuning(device, config)
     else:
-        untrained_model = init_model(device, configs.model)
-        model = train(train_data_loader, valid_data_loader, untrained_model, device, configs.train,
-                      configs.tenant_id, configs.run_date, tune_params=False)
-        save_pytorch_model(model, 'ceasterwood', configs.tenant_id, configs.run_date, None)
+        untrained_model = init_model(config.model, device=device)
+        model = train(train_data_loader, valid_data_loader, untrained_model, config.train,
+                      config.tenant_id, config.run_date, device=device, tune_params=False)
+        save_pytorch_model(model, config.bucket, config.tenant_id, config.run_date, config.sampling)
 
     # Evaluate training history
-    history = pd.read_csv(f'{configs.tenant_id}/{configs.run_date}/history.csv')
-    plot_training_loss(history, tune_metric=configs.train.tune_metric,
-                       filepath=f'{configs.tenant_id}/{configs.run_date}/training_loss.png')
+    history = pd.read_csv(f'{config.tenant_id}/{config.run_date}/history.csv')
+    plot_training_loss(history, tune_metric=config.train.tune_metric,
+                       filepath=f'{config.tenant_id}/{config.run_date}/training_loss.png')
 
     # Evaluate model on test set
-    test_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='test')
-    metrics = calculate_test_metrics(test_event_seqs, model, device, loader_configs=configs.data_loader)
+    test_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='test')
+    metrics = calculate_test_metrics(test_event_seqs, model, device, loader_configs=config.data_loader)
     pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
-        .to_json(f'{configs.tenant_id}/{configs.run_date}/test_metrics.json')
+        .to_json(f'{config.tenant_id}/{config.run_date}/test_metrics.json')
     plot_avg_incidence_at_k(metrics, ks=model.ks,
-                            filepath=f'{configs.tenant_id}/{configs.run_date}/avg_incidence_at_k.png')
+                            filepath=f'{config.tenant_id}/{config.run_date}/avg_incidence_at_k.png')
 
     # Calculate infectivity
-    if not configs.skip_eval_infectivity:
+    if not config.skip_eval_infectivity:
         attribution_matrix = calculate_infectivity(
             train_event_seqs,
             model,
             device,
-            loader_configs=configs.data_loader,
-            attribution_configs=configs.attribution
+            loader_configs=config.data_loader,
+            attribution_configs=config.attribution
         )
-        save_attributions(attribution_matrix, configs.bucket, configs.tenant_id, configs.run_date)
+        save_attributions(attribution_matrix, config.bucket, config.tenant_id, config.run_date)
         print(attribution_matrix.shape)
 
     # Predict future event intensities on test set
-    model = load_pytorch_object(configs.bucket, configs.tenant_id, configs.run_date, configs.sampling, 'model')
-    pred_event_seqs = load_event_seqs(configs.tenant_id, configs.run_date, dataset='pred')
+    model = load_pytorch_object(config.bucket, config.tenant_id, config.run_date, config.sampling, 'model')
+    pred_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='pred')
     intensities, cumulants = predict(
         pred_event_seqs,
         model,
         device,
-        loader_configs=configs.data_loader,
-        time_steps=range(configs.predict.min_time_steps, configs.predict.max_time_steps + 1)
+        loader_configs=config.data_loader,
+        time_steps=range(config.predict.min_time_steps, config.predict.max_time_steps + 1)
     )
     for dataset, name in [(intensities, 'event_intensities'), (cumulants, 'event_cumulants')]:
         print(name, dataset.shape)
-        save_pytorch_dataset(dataset, configs.bucket, configs.tenant_id,
-                             configs.run_date, configs.sampling, name)
+        save_pytorch_dataset(dataset, config.bucket, config.tenant_id,
+                             config.run_date, config.sampling, name)
 
 
 def get_device(cuda: bool, dynamic: bool = False):
@@ -150,7 +150,7 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
         return data_loader
 
 
-def init_model(device, model_configs):
+def init_model(model_configs, device=None):
     if type(model_configs['embedding_dim']) != int:
         # The model configs are from config.yml and not for tuning
         model_configs['embedding_dim'] = model_configs['embedding_dim']['default']
@@ -168,13 +168,17 @@ def init_model(device, model_configs):
         max_log_basis_weight=model_configs['max_log_basis_weight'],
         ks=model_configs['ks'],
     )
-    model = model.to(device)
+    if device is not None:
+        model = model.to(device)
     return model
 
 
-def train(train_data_loader, valid_data_loader, model, device, train_configs, tenant_id, run_date, tune_params=True):
+def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date, device=None, tune_params=True):
     bucket = 'ceasterwood'
     sampling = None
+    if device is None:
+        device = get_device(cuda=True)
+        model.to(device)
 
     if type(train_configs['lr']) != float:
         # The train configs are from config.yml and not for tuning
@@ -183,6 +187,18 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
     optimizer = getattr(torch.optim, train_configs['optimizer'])(
         model.parameters(), lr=train_configs['lr']
     )
+
+    # Load existing checkpoint if it exists
+    # TODO: does this exist if not doing tuning?
+    checkpoint = session.get_checkpoint()
+    if checkpoint:
+        checkpoint_state = checkpoint.to_dict()
+        start_epoch = checkpoint_state['epoch']
+        # history = checkpoint_state['history']
+        model.load_state_dict(checkpoint_state['model_state_dict'])
+        optimizer.load_state_dict(checkpoint_state['optimizer_state_dict'])
+    else:
+        start_epoch = 0
 
     model.train()
 
@@ -194,7 +210,7 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
         for loss_type in ['train', 'valid']
     }
     dt = []
-    for epoch in range(train_configs['epochs']):
+    for epoch in range(start_epoch, train_configs['epochs']):
         start = datetime.now()
         print(f'Epoch {epoch}: {start}')
         train_metrics, valid_metrics = model.train_epoch(
@@ -208,7 +224,7 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
         for loss_type in ['train', 'valid']:
             for metric in model.metrics:
                 epoch_metrics[loss_type][metric].update(
-                    eval(f'{loss_type}_metrics')[metric].avg,
+                    eval(f'{loss_type}_metrics')[metric].avg.item(),
                     n=eval(f'{loss_type}_metrics')[metric].count,
                 )
         end = datetime.now()
@@ -223,7 +239,18 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
         if valid_metrics[tune_metric].avg < best_metric:
             best_epoch = epoch
             best_metric = valid_metrics[tune_metric].avg
-            if not tune_params:
+            if tune_params:
+                checkpoint_data = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }
+                checkpoint = Checkpoint.from_dict(checkpoint_data)
+                session.report(
+                    {k: v.avg for k, v in epoch_metrics['valid'].items()},
+                    checkpoint=checkpoint,
+                )
+            else:
                 save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
 
         if epoch - best_epoch >= train_configs['patience']:
@@ -235,94 +262,83 @@ def train(train_data_loader, valid_data_loader, model, device, train_configs, te
         # Reset model to the last-saved (best) version of the model
         model = load_pytorch_object(bucket, tenant_id, run_date, sampling, 'model')
 
-    # Save training history
-    history = pd.DataFrame({
-        'epoch': range(epoch + 1),
-        'dt': dt,
-    })
-    for loss_type in ['train', 'valid']:
-        for metric in model.metrics:
-            history[f'{loss_type}_{metric}'] = epoch_metrics[loss_type][metric].values
+        # Save training history
+        history = pd.DataFrame({
+            'epoch': range(epoch + 1),
+            'dt': dt,
+        })
+        for loss_type in ['train', 'valid']:
+            for metric in model.metrics:
+                history[f'{loss_type}_{metric}'] = epoch_metrics[loss_type][metric].values
 
-    if tune_params:
-        checkpoint_data = {
-            'epoch': epoch,
-            'history': history,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }
-        checkpoint = Checkpoint.from_dict(checkpoint_data)
-
-        session.report(
-            {k: v.avg for k, v in epoch_metrics['valid'].items()},
-            checkpoint=checkpoint,
-        )
-    else:
         history.to_csv(f'{tenant_id}/{run_date}/history.csv', index=False)
 
     return model
 
 
-def train_with_tuning(device, configs):
+def train_with_tuning(device, config):
     def __train_with_tuning(__search_space, tenant_id, run_date):
         train_event_seqs = load_event_seqs(tenant_id, run_date, dataset='train')
         train_data_loader, valid_data_loader = init_data_loader(
             train_event_seqs, __search_space['data_loader'], dataset='train')
-        untrained_model = init_model(device, __search_space['model'])
-        _ = train(train_data_loader, valid_data_loader, untrained_model, device, __search_space['train'],
+        untrained_model = init_model(__search_space['model'])
+        _ = train(train_data_loader, valid_data_loader, untrained_model, __search_space['train'],
                   tenant_id, run_date, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
         'data_loader': {
-            'train_validation_split': configs.data_loader.train_validation_split,
-            'bucket_seqs': configs.data_loader.bucket_seqs,
+            'train_validation_split': config.data_loader.train_validation_split,
+            'bucket_seqs': config.data_loader.bucket_seqs,
             'batch_size': tune.choice([2 ** i for i in range(
-                configs.data_loader.batch_size.min_pow_2, configs.data_loader.batch_size.max_pow_2)]),
-            'num_workers': configs.data_loader.num_workers,
+                config.data_loader.batch_size.min_pow_2, config.data_loader.batch_size.max_pow_2)]),
+            'num_workers': config.data_loader.num_workers,
         },
         'model': {
-            'n_event_types': configs.model.n_event_types,
+            'n_event_types': config.model.n_event_types,
             'embedding_dim': tune.choice([2 ** i for i in range(
-                configs.model.embedding_dim.min_pow_2, configs.model.embedding_dim.max_pow_2)]),
+                config.model.embedding_dim.min_pow_2, config.model.embedding_dim.max_pow_2)]),
             'hidden_size': tune.choice([2 ** i for i in range(
-                configs.model.hidden_size.min_pow_2, configs.model.hidden_size.max_pow_2)]),
-            'rnn': configs.model.rnn,
-            'dropout': tune.quniform(configs.model.dropout.min, configs.model.dropout.max, 0.01),
-            'basis_type': configs.model.basis_type,
-            'basis_means': configs.model.basis_means,
-            'max_log_basis_weight': configs.model.max_log_basis_weight,
-            'ks': configs.model.ks,
+                config.model.hidden_size.min_pow_2, config.model.hidden_size.max_pow_2)]),
+            'rnn': config.model.rnn,
+            'dropout': tune.quniform(config.model.dropout.min, config.model.dropout.max, 0.01),
+            'basis_type': config.model.basis_type,
+            'basis_means': config.model.basis_means,
+            'max_log_basis_weight': config.model.max_log_basis_weight,
+            'ks': config.model.ks,
         },
         'train': {
-            'optimizer': configs.train.optimizer,
-            'lr': tune.qloguniform(configs.train.lr.min, configs.train.lr.max, 1.e-5),
-            'epochs': configs.train.epochs,
-            'l2_reg': configs.train.l2_reg,
-            'tune_metric': configs.train.tune_metric,
-            'patience': configs.train.patience,
+            'optimizer': config.train.optimizer,
+            'lr': tune.qloguniform(config.train.lr.min, config.train.lr.max, 1.e-5),
+            'epochs': config.train.epochs,
+            'l2_reg': config.train.l2_reg,
+            'tune_metric': config.train.tune_metric,
+            'patience': config.train.patience,
         }
     }
 
     # Test different hyperparameter combinations using AsyncHyperBand algorithm
     scheduler = ASHAScheduler(
-        metric=configs.train.tune_metric,
+        metric=config.train.tune_metric,
         mode='min',
-        max_t=10,
-        grace_period=configs.tuning.grace_period,
-        reduction_factor=configs.tuning.reduction_factor,
+        max_t=config.tuning.max_training_iterations,
+        grace_period=config.tuning.grace_period,
+        reduction_factor=config.tuning.reduction_factor,
     )
     result = tune.run(
-        partial(__train_with_tuning, tenant_id=configs.tenant_id, run_date=configs.run_date),
-        resources_per_trial={'cpu': 2, 'gpu': 0},
+        partial(__train_with_tuning, tenant_id=config.tenant_id, run_date=config.run_date),
+        resources_per_trial={'cpu': 4, 'gpu': 0},
         config=search_space,
-        num_samples=configs.tuning.n_param_combos,
+        num_samples=config.tuning.n_param_combos,
         scheduler=scheduler,
     )
 
     # Initialize model with best hyperparameters
-    best_trial = result.get_best_trial(configs.train.tune_metric, 'min', 'last')
-    best_model = init_model(device, best_trial.config)
+    tune_metric = config.train.tune_metric
+    best_trial = result.get_best_trial(tune_metric, 'min', 'last')
+    print(f'Best trial config: {best_trial.config}')
+    print(f'Best trial validation {tune_metric}: {best_trial.last_result[tune_metric]}')
+    best_model = init_model(best_trial.config['model'], device)
 
     # Load weights from best trial
     best_checkpoint_data = best_trial.checkpoint.to_air_checkpoint().to_dict()
