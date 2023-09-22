@@ -223,10 +223,11 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
         # Store training and validation metrics for this epoch
         for loss_type in ['train', 'valid']:
             for metric in model.metrics:
-                epoch_metrics[loss_type][metric].update(
-                    eval(f'{loss_type}_metrics')[metric].avg.item(),
-                    n=eval(f'{loss_type}_metrics')[metric].count,
-                )
+                n = eval(f'{loss_type}_metrics')[metric].count
+                val = eval(f'{loss_type}_metrics')[metric].avg
+                if type(val) == torch.Tensor:
+                    val = val.item()
+                epoch_metrics[loss_type][metric].update(val, n=n)
         end = datetime.now()
         dt.append((end - start).total_seconds())
 
