@@ -261,17 +261,20 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
                 {k: v.avg for k, v in epoch_metrics['valid'].items()},
                 checkpoint=checkpoint,
             )
-        else:
-            # Manually determine if training should stop early
-            if valid_metrics[tune_metric].avg < best_metric:
-                best_epoch = epoch
-                best_metric = valid_metrics[tune_metric].avg
+
+        # Manually check if training should stop early
+        # Note: Even if using Ray Tune, we want to manually cut off training if the error is not improving
+        # Ray Tune only stops training at specific checkpoints, like epoch = 1, 2, 8, 16, 64, etc.
+        if valid_metrics[tune_metric].avg < best_metric:
+            best_epoch = epoch
+            best_metric = valid_metrics[tune_metric].avg
+            if not tune_params:
                 save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
 
-            if epoch - best_epoch >= train_configs['patience']:
-                print(f'Stopped training early at epoch {epoch}: ' +
-                      f'Failed to improve validation {tune_metric} in last {train_configs["patience"]} epochs')
-                break
+        if epoch - best_epoch >= train_configs['patience']:
+            print(f'Stopped training early at epoch {epoch}: ' +
+                  f'Failed to improve validation {tune_metric} in last {train_configs["patience"]} epochs')
+            break
 
     if not tune_params:
         # Reset model to the last-saved (best) version of the model
@@ -334,7 +337,7 @@ def train_with_tuning(device, config):
     )
     result = tune.run(
         partial(__train_with_tuning, tenant_id=config.tenant_id, run_date=config.run_date),
-        resources_per_trial={'cpu': 4, 'gpu': 0},
+        resources_per_trial={'cpu': 8, 'gpu': 0},
         config=search_space,
         num_samples=config.tuning.n_param_combos,
         scheduler=scheduler,
