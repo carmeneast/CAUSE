@@ -337,7 +337,7 @@ def train_with_tuning(device, config):
     )
     result = tune.run(
         partial(__train_with_tuning, tenant_id=config.tenant_id, run_date=config.run_date),
-        resources_per_trial={'cpu': 8, 'gpu': 0},
+        # resources_per_trial={'cpu': 8, 'gpu': 0},
         config=search_space,
         num_samples=config.tuning.n_param_combos,
         scheduler=scheduler,
