@@ -67,15 +67,15 @@ train:
     min: 1.e-5
     max: 1.e-1
     default: 1.e-3
-  epochs: 100
+  epochs: 150
   l2_reg: 0
   tune_metric: 'nll'
   patience: 3
 
 tuning:
-  max_training_iterations: 100  # max number of epochs to train any model
+  max_training_iterations: 150  # max number of epochs to train any model
   grace_period: 1  # min number of epochs to train any model
-  reduction_factor: 2  # for HyperBand algorithm
+  reduction_factor: 1  # number of times to iterate over the HyperBand algorithm
   n_param_combos: 30
 
 attribution:
