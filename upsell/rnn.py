@@ -255,7 +255,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
                (log_intensities < np.log(k * (1 + eps/2)))
         events_w_intensity_k = batch[:, :, 1:].masked_select(mask)
 
-        # Check average incidence of events with intensity >= k
+        # Check average incidence of events with 0.95k <= intensity < 1.05k
         avg_incidence = events_w_intensity_k.mean()
         n = len(events_w_intensity_k)
         return avg_incidence, n

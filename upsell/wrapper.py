@@ -410,5 +410,9 @@ def predict(event_seqs, model, device, loader_configs, time_steps=range(1, 5)):
 
 
 if __name__ == '__main__':
-    DEVICE, CONFIG = init_env(1309, '2023-07-01')
+    TENANT_ID = 1309
+    RUN_DATE = '2023-07-01'
+    BUCKET = 'ceasterwood'
+
+    DEVICE, CONFIG = init_env(TENANT_ID, RUN_DATE, BUCKET)
     run(DEVICE, CONFIG, tune_params=True)

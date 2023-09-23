@@ -74,7 +74,7 @@ train:
 
 tuning:
   max_training_iterations: 100  # max number of epochs to train any model
-  grace_period: 2  # min number of epochs to train any model
+  grace_period: 1  # min number of epochs to train any model
   reduction_factor: 2  # for HyperBand algorithm
   n_param_combos: 30
 
