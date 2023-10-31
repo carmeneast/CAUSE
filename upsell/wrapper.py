@@ -36,7 +36,7 @@ def init_env(tenant_id, run_date, bucket='ceasterwood', sampling=None):
 
 def run(device, config, tune_params=True):
     # Get event sequences
-    train_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='train')
+    train_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.sampling, dataset='train')
 
     # Train model
     if tune_params:
@@ -45,7 +45,7 @@ def run(device, config, tune_params=True):
         train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, config.data_loader, dataset='train')
         untrained_model = init_model(config.model, device=device)
         model = train(train_data_loader, valid_data_loader, untrained_model, config.train,
-                      config.tenant_id, config.run_date, device=device, tune_params=False)
+                      config.tenant_id, config.run_date, config.sampling, device=device, tune_params=False)
         save_pytorch_model(model, config.bucket, config.tenant_id, config.run_date, config.sampling)
 
     # Evaluate training history
@@ -54,7 +54,7 @@ def run(device, config, tune_params=True):
                        filepath=f'{config.tenant_id}/{config.run_date}/training_loss.png')
 
     # Evaluate model on test set
-    test_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='test')
+    test_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.sampling, dataset='test')
     metrics = calculate_test_metrics(test_event_seqs, model, device, loader_configs=config.data_loader)
     pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
         .to_json(f'{config.tenant_id}/{config.run_date}/test_metrics.json')
@@ -74,7 +74,7 @@ def run(device, config, tune_params=True):
         print(attribution_matrix.shape)
 
     # Predict future event intensities on test set
-    pred_event_seqs = load_event_seqs(config.tenant_id, config.run_date, dataset='pred')
+    pred_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.sampling, dataset='pred')
     intensities, cumulants = predict(
         pred_event_seqs,
         model,
@@ -99,9 +99,8 @@ def get_device(cuda: bool, dynamic: bool = False):
     return device
 
 
-def load_event_seqs(tenant_id, run_date, dataset='train'):
+def load_event_seqs(tenant_id, run_date, sampling=None, dataset='train'):
     bucket = 'ceasterwood'
-    sampling = None
     data = load_numpy_data(bucket, tenant_id, run_date, sampling, dataset)
     event_seqs = data['event_seqs']
 
@@ -113,12 +112,15 @@ def load_event_seqs(tenant_id, run_date, dataset='train'):
 
 
 def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribution: bool = False):
-    if not attribution and type(loader_configs['batch_size']) != int:
-        # The train configs are from config.yml and not for tuning
-        loader_configs['batch_size'] = loader_configs['batch_size']['default']
+    if attribution:
+        batch_size = loader_configs['attr_batch_size']
+    elif type(loader_configs['batch_size']) == int:
+        batch_size = loader_configs['batch_size']
+    else:
+        batch_size = loader_configs['batch_size']['default']
 
     data_loader_args = {
-        'batch_size': loader_configs['attr_batch_size'] if attribution else loader_configs['batch_size'],
+        'batch_size': batch_size,
         'collate_fn': EventSeqDataset.collate_fn,
         'num_workers': loader_configs['num_workers'],
     }
@@ -150,18 +152,15 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
 
 
 def init_model(model_configs, device=None):
-    if type(model_configs['embedding_dim']) != int:
-        # The model configs are from config.yml and not for tuning
-        model_configs['embedding_dim'] = model_configs['embedding_dim']['default']
-        model_configs['hidden_size'] = model_configs['hidden_size']['default']
-        model_configs['dropout'] = model_configs['dropout']['default']
-
     model = ExplainableRecurrentPointProcess(
         n_event_types=model_configs['n_event_types'],
-        embedding_dim=model_configs['embedding_dim'],
-        hidden_size=model_configs['hidden_size'],
+        embedding_dim=model_configs['embedding_dim'] if type(model_configs['embedding_dim']) == int
+        else model_configs['embedding_dim']['default'],
+        hidden_size=model_configs['hidden_size'] if type(model_configs['hidden_size']) == int
+        else model_configs['hidden_size']['default'],
         rnn=model_configs['rnn'],
-        dropout=model_configs['dropout'],
+        dropout=model_configs['dropout'] if type(model_configs['dropout']) == float
+        else model_configs['dropout']['default'],
         basis_type=model_configs['basis_type'],
         basis_means=model_configs['basis_means'],
         max_log_basis_weight=model_configs['max_log_basis_weight'],
@@ -172,25 +171,21 @@ def init_model(model_configs, device=None):
     return model
 
 
-def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date,
+def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date, sampling,
           device=None, tune_params=True):
     bucket = 'ceasterwood'
-    sampling = None
     if device is None:
         device = get_device(cuda=True)
         model.to(device)
 
-    if type(train_configs['lr']) != float:
-        # The train configs are from config.yml and not for tuning
-        train_configs['lr'] = train_configs['lr']['default']
-
     optimizer = getattr(torch.optim, train_configs['optimizer'])(
-        model.parameters(), lr=train_configs['lr']
+        model.parameters(), lr=train_configs['lr'] if type(train_configs['lr']) == float
+        else train_configs['lr']['default']
     )
 
     # Load existing checkpoint if it exists
     # TODO: does this exist if not doing tuning?
-    checkpoint = session.get_checkpoint()
+    checkpoint = session.get_checkpoint() if tune_params else None
     if checkpoint:
         checkpoint_state = checkpoint.to_dict()
         start_epoch = checkpoint_state['epoch']
@@ -287,13 +282,13 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
 
 
 def train_with_tuning(device, config):
-    def __train_with_tuning(__search_space, tenant_id, run_date):
-        train_event_seqs = load_event_seqs(tenant_id, run_date, dataset='train')
+    def __train_with_tuning(__search_space, tenant_id, run_date, sampling):
+        train_event_seqs = load_event_seqs(tenant_id, run_date, sampling, dataset='train')
         train_data_loader, valid_data_loader = init_data_loader(
             train_event_seqs, __search_space['data_loader'], dataset='train')
         untrained_model = init_model(__search_space['model'])
         _ = train(train_data_loader, valid_data_loader, untrained_model, __search_space['train'],
-                  tenant_id, run_date, tune_params=True)
+                  tenant_id, run_date, sampling, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
@@ -336,7 +331,7 @@ def train_with_tuning(device, config):
         reduction_factor=config.tuning.reduction_factor,
     )
     result = tune.run(
-        partial(__train_with_tuning, tenant_id=config.tenant_id, run_date=config.run_date),
+        partial(__train_with_tuning, tenant_id=config.tenant_id, run_date=config.run_date, sampling=config.sampling),
         # resources_per_trial={'cpu': 8, 'gpu': 0},
         config=search_space,
         num_samples=config.tuning.n_param_combos,
@@ -416,6 +411,7 @@ if __name__ == '__main__':
     TENANT_ID = 1309
     RUN_DATE = '2023-07-01'
     BUCKET = 'ceasterwood'
+    SAMPLING = None
 
-    DEVICE, CONFIG = init_env(TENANT_ID, RUN_DATE, BUCKET)
+    DEVICE, CONFIG = init_env(TENANT_ID, RUN_DATE, BUCKET, SAMPLING)
     run(DEVICE, CONFIG, tune_params=True)
