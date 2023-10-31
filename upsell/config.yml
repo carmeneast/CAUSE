@@ -70,7 +70,9 @@ train:
   epochs: 150
   l2_reg: 0
   tune_metric: 'nll'
-  patience: 4
+  patience:
+    no_tuning: 3
+    ray_tune: 4
 
 tuning:
   max_training_iterations: 150  # max number of epochs to train any model

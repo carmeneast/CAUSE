@@ -49,17 +49,17 @@ def run(device, config, tune_params=True):
         save_pytorch_model(model, config.bucket, config.tenant_id, config.run_date, config.sampling)
 
     # Evaluate training history
-    history = pd.read_csv(f'{config.tenant_id}/{config.run_date}/history.csv')
+    history = pd.read_csv(f'{config.tenant_id}/{config.run_date}/{config.sampling}/history.csv')
     plot_training_loss(history, tune_metric=config.train.tune_metric,
-                       filepath=f'{config.tenant_id}/{config.run_date}/training_loss.png')
+                       filepath=f'{config.tenant_id}/{config.run_date}/{config.sampling}/training_loss.png')
 
     # Evaluate model on test set
     test_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.sampling, dataset='test')
     metrics = calculate_test_metrics(test_event_seqs, model, device, loader_configs=config.data_loader)
     pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
-        .to_json(f'{config.tenant_id}/{config.run_date}/test_metrics.json')
+        .to_json(f'{config.tenant_id}/{config.run_date}/{config.sampling}/test_metrics.json')
     plot_avg_incidence_at_k(metrics, ks=model.ks,
-                            filepath=f'{config.tenant_id}/{config.run_date}/avg_incidence_at_k.png')
+                            filepath=f'{config.tenant_id}/{config.run_date}/{config.sampling}/avg_incidence_at_k.png')
 
     # Calculate infectivity
     if not config.attribution.skip_eval_infectivity:
@@ -113,11 +113,11 @@ def load_event_seqs(tenant_id, run_date, sampling=None, dataset='train'):
 
 def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribution: bool = False):
     if attribution:
-        batch_size = loader_configs['attr_batch_size']
+        batch_size = loader_configs.attr_batch_size
     elif type(loader_configs['batch_size']) == int:
         batch_size = loader_configs['batch_size']
     else:
-        batch_size = loader_configs['batch_size']['default']
+        batch_size = loader_configs.batch_size.default
 
     data_loader_args = {
         'batch_size': batch_size,
@@ -155,12 +155,12 @@ def init_model(model_configs, device=None):
     model = ExplainableRecurrentPointProcess(
         n_event_types=model_configs['n_event_types'],
         embedding_dim=model_configs['embedding_dim'] if type(model_configs['embedding_dim']) == int
-        else model_configs['embedding_dim']['default'],
+        else model_configs.embedding_dim.default,
         hidden_size=model_configs['hidden_size'] if type(model_configs['hidden_size']) == int
-        else model_configs['hidden_size']['default'],
+        else model_configs.hidden_size.default,
         rnn=model_configs['rnn'],
         dropout=model_configs['dropout'] if type(model_configs['dropout']) == float
-        else model_configs['dropout']['default'],
+        else model_configs.dropout.default,
         basis_type=model_configs['basis_type'],
         basis_means=model_configs['basis_means'],
         max_log_basis_weight=model_configs['max_log_basis_weight'],
@@ -174,13 +174,15 @@ def init_model(model_configs, device=None):
 def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date, sampling,
           device=None, tune_params=True):
     bucket = 'ceasterwood'
+    patience = train_configs['patience'] if tune_params else train_configs.patience.no_tuning
+
     if device is None:
         device = get_device(cuda=True)
         model.to(device)
 
     optimizer = getattr(torch.optim, train_configs['optimizer'])(
         model.parameters(), lr=train_configs['lr'] if type(train_configs['lr']) == float
-        else train_configs['lr']['default']
+        else train_configs.lr.default
     )
 
     # Load existing checkpoint if it exists
@@ -266,9 +268,9 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
             if not tune_params:
                 save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
 
-        if epoch - best_epoch >= train_configs['patience']:
+        if epoch - best_epoch >= patience:
             print(f'Stopped training early at epoch {epoch}: ' +
-                  f'Failed to improve validation {tune_metric} in last {train_configs["patience"]} epochs')
+                  f'Failed to improve validation {tune_metric} in last {patience} epochs')
             break
 
     if not tune_params:
@@ -276,7 +278,7 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
         model = load_pytorch_object(bucket, tenant_id, run_date, sampling, 'model')
 
         # Save training history
-        history.to_csv(f'{tenant_id}/{run_date}/history.csv', index=False)
+        history.to_csv(f'{tenant_id}/{run_date}/{sampling}/history.csv', index=False)
 
     return model
 
@@ -318,7 +320,7 @@ def train_with_tuning(device, config):
             'epochs': config.train.epochs,
             'l2_reg': config.train.l2_reg,
             'tune_metric': config.train.tune_metric,
-            'patience': config.train.patience,
+            'patience': config.train.patience.ray_tune,
         }
     }
 
