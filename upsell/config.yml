@@ -4,9 +4,9 @@ env:
 
 preprocessing:
   seed: 42
-  sampling:  # These configs result in a maximum sample size of 102,000 accounts
-    # TODO: min_positives required to train a model
-    max_positives: 6000
+  sampling:  # These configs result in a sample size between 3,400 and 51,000 accounts
+    min_positives: 200
+    max_positives: 3000
     neg_w_activity_prop: 8
     neg_w_intent_prop: 4
     neg_w_none_prop: 4
