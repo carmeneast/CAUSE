@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from upsell.configs import load_yaml_config
 from upsell.preprocessing.country_map import COUNTRY_MAP
 from upsell.preprocessing.top_n_rollup import TopNCategoryRollUp, TopNCategoryRollUpModel
-from upsell.preprocessing.activity_rollup import ActivityRoleCategoryRollUp, ActivityRoleCategoryRollUpModel
+from upsell.preprocessing.event_type_rollup import HierarchicalEventTypeRollUp, HierarchicalEventTypeRollUpModel
 
 
 class CausePreprocessing:
@@ -32,9 +32,12 @@ class CausePreprocessing:
 
         self.CONFIG = load_yaml_config('upsell/config.yml').preprocessing
 
+        self.model_path = f'upsell/{self.tenant_id}/{self.run_date}/'  # {self.sampling}'
+        self.transformed_data_path = f's3://{self.bucket}/{self.model_path}'
+
         self.firmo_rollup: Optional[PipelineModel] = None
         self.firmo_categories: Optional[Dict[str, List[str]]] = None
-        self.activity_rollup: Optional[PipelineModel] = None
+        self.event_type_rollup: Optional[DataFrame] = None
         self.n_event_types = None
         self.event_type_names = None
 
@@ -77,9 +80,6 @@ class CausePreprocessing:
 
     def apply_preprocessing(self, accounts: DataFrame, activity_events: DataFrame,
                             opp_events: DataFrame, intent_events: DataFrame, dataset: str = 'train'):
-        model_path = f'upsell/{self.tenant_id}/{self.run_date}/'  # {self.sampling}'
-        transformed_data_path = f's3://{self.bucket}/{model_path}'
-
         # Clean firmographics data
         print('Cleaning firmographics data...')
         accounts_cleaned = self.clean_firmographics(accounts)
@@ -88,22 +88,24 @@ class CausePreprocessing:
             # Fit firmographic roll-up
             print('Fitting firmographic roll-up...')
             self.firmo_rollup, self.firmo_categories = self.fit_firmographic_roll_up(accounts_cleaned)
-            self.firmo_rollup.write().overwrite().save(f'{transformed_data_path}/firmo_rollup_pipeline')
-            self.save_json(self.firmo_categories, f'{transformed_data_path}/firmo_categories')
+            self.firmo_rollup.write().overwrite().save(f'{self.transformed_data_path}/firmo_rollup_pipeline')
+            self.save_json(self.firmo_categories, f'{self.transformed_data_path}/firmo_categories')
 
-            # Fit activity roll-up
-            print('Fitting activity roll-up...')
-            self.activity_rollup = self.fit_activity_roll_up(
+            # Fit activity + intent roll-up
+            print('Fitting activity + intent event roll-up...')
+            self.event_type_rollup = self.fit_event_type_roll_up(
                 activity_events.join(accounts_cleaned.select('tenant_id', 'account_id'),
-                                     on=['tenant_id', 'account_id'], how='inner')
+                                     on=['tenant_id', 'account_id'], how='inner'),
+                intent_events.join(accounts_cleaned.select('tenant_id', 'account_id'),
+                                   on=['tenant_id', 'account_id'], how='inner')
             )
-            self.save_json(self.activity_rollup, f'{transformed_data_path}/activity_rollup_pipeline')
+            self.save_json(self.event_type_rollup, f'{self.transformed_data_path}/event_type_rollup_pipeline')
         else:
             # Load roll-ups
             print('Loading preprocessors...')
-            self.firmo_rollup = PipelineModel.load(f'{transformed_data_path}/firmo_rollup_pipeline')
-            self.firmo_categories = self.spark.read.json(f'{transformed_data_path}/firmo_categories')
-            self.activity_rollup = self.spark.read.json(f'{transformed_data_path}/activity_rollup_pipeline')
+            self.firmo_rollup = PipelineModel.load(f'{self.transformed_data_path}/firmo_rollup_pipeline')
+            self.firmo_categories = self.spark.read.json(f'{self.transformed_data_path}/firmo_categories')
+            self.event_type_rollup = self.spark.read.json(f'{self.transformed_data_path}/event_type_rollup_pipeline')
 
         # Roll up firmographics and activities
         print('Rolling up firmographics...')
@@ -117,13 +119,7 @@ class CausePreprocessing:
             accounts_transformed = model.transform(accounts_transformed)
 
         print('Rolling up activities...')
-        categories = self.activity_rollup.rdd.map(lambda x: x['categories']).collect()[0]
-        print(len(categories), categories[:5])
-        model = ActivityRoleCategoryRollUpModel(self.CONFIG.seed, categories)
-        activities_transformed = model.transform(
-            activity_events.join(accounts_cleaned.select('tenant_id', 'account_id'),
-                                 on=['tenant_id', 'account_id'], how='inner')
-        )
+        rolled_up_events = self.apply_event_type_roll_up(accounts_cleaned, activity_events, intent_events)
 
         # Create firmographic events
         print('Creating firmographic events...')
@@ -131,17 +127,16 @@ class CausePreprocessing:
 
         # Combine events
         print('Combining events...')
-        all_events = self.combine_events(accounts_transformed, firmo_events, opp_events, intent_events,
-                                         activities_transformed)
-        self.save_parquet(all_events, f'{transformed_data_path}/{dataset}_all_events')
+        all_events = self.combine_events(accounts_transformed, firmo_events, opp_events, rolled_up_events)
+        self.save_parquet(all_events, f'{self.transformed_data_path}/{dataset}_all_events')
 
         if dataset == 'train':
             # Get event type names
             print('Getting event type names...')
             self.event_type_names = all_events.select('event_type').distinct().orderBy('event_type').coalesce(1).cache()
-            self.save_parquet(self.event_type_names, f'{transformed_data_path}/event_type_names')
+            self.save_parquet(self.event_type_names, f'{self.transformed_data_path}/event_type_names')
         else:
-            self.event_type_names = self.spark.read.parquet(f'{transformed_data_path}/event_type_names').cache()
+            self.event_type_names = self.spark.read.parquet(f'{self.transformed_data_path}/event_type_names').cache()
 
         self.n_event_types = self.event_type_names.count()
         print(f'Event types: {self.n_event_types}')
@@ -275,8 +270,13 @@ class CausePreprocessing:
         country_map = create_map([lit(x) for x in chain(*COUNTRY_MAP.items())])
 
         def normalize_country(c: Column) -> Column:
-            # remove punctuation
-            cleaned_col = regexp_replace(lower(trim(c)), '[^\\w\\s]', ' ')
+            cleaned_col = regexp_replace(
+                regexp_replace(
+                    regexp_replace(
+                        lower(trim(c)), '\\.', ''  # remove periods, e.g. 'U.S.A.' -> 'USA'
+                    ), '[^\\w\\s]', ' '  # remove other punctuation
+                ), '\\s+', ' '  # remove extra whitespace
+            )
             # map variations of country names to 2-digit codes
             return when(~cleaned_col.isin(['', 'unknown']), coalesce(lower(country_map[cleaned_col]), cleaned_col))
 
@@ -385,22 +385,73 @@ class CausePreprocessing:
         return (firmo_rollup.fit(train_accounts),
                 self.spark.createDataFrame(feat_categories, schema=['feature', 'categories']))
 
-    def fit_activity_roll_up(self, train_activities: DataFrame) -> DataFrame:
-        transformer = ActivityRoleCategoryRollUp(
-            min_occurrences=self.CONFIG.activity_rollup.min_occurrences,
-            min_accounts=self.CONFIG.activity_rollup.min_accounts,
+    def fit_event_type_roll_up(self, train_activities: DataFrame, train_intent_events: DataFrame) -> DataFrame:
+        activity_transformer = HierarchicalEventTypeRollUp(
+            min_occurrences=self.CONFIG.event_rollup.default.min_occurrences,
+            min_accounts=self.CONFIG.event_rollup.default.min_accounts,
         )
-        # pipeline = Pipeline(stages=[transformer])
+        # pipeline = Pipeline(stages=[activity_transformer])
         # return pipeline.fit(train_activities)
-        activities = transformer.fit(train_activities).activities
-        return self.spark.createDataFrame([('activities', activities)], schema=['feature', 'categories'])
+        activities = activity_transformer.fit(train_activities).event_types
+
+        kwd_transformer = HierarchicalEventTypeRollUp(
+            min_occurrences=self.CONFIG.event_rollup.default.min_occurrences,
+            min_accounts=self.CONFIG.event_rollup.default.min_accounts,
+        )
+        kwd_intent = kwd_transformer.fit(
+            train_intent_events.filter(col('event_type').startswith('DB Keyword Intent|'))
+        ).event_types
+
+        surge_transformer = HierarchicalEventTypeRollUp(
+            min_occurrences=self.CONFIG.event_rollup.intent_surge.min_occurrences,
+            min_accounts=self.CONFIG.event_rollup.intent_surge.min_accounts,
+        )
+        intent_surge = surge_transformer.fit(
+            train_intent_events.filter(col('event_type').startswith('Intent Surge|'))
+        ).event_types
+        return self.spark.createDataFrame(
+            [
+                ('activities', activities),
+                ('kwd_intent', kwd_intent),
+                ('intent_surge', intent_surge)
+            ],
+            schema=['feature', 'categories']
+        )
+
+    def apply_event_type_roll_up(self, accounts_cleaned: DataFrame, activity_events: DataFrame,
+                                 intent_events: DataFrame) -> DataFrame:
+        rolled_up_events = None
+        for feature in ['activities', 'kwd_intent', 'intent_surge']:
+            print(f'Applying event type roll-up to {feature}...')
+            categories = self.event_type_rollup.filter(col('feature') == feature) \
+                .rdd.map(lambda x: x['categories']).collect()[0]
+            print(len(categories), categories[:5])
+            model = HierarchicalEventTypeRollUpModel(self.CONFIG.seed, categories)
+
+            if feature == 'activities':
+                events = activity_events
+            elif feature == 'kwd_intent':
+                events = intent_events.filter(col('event_type').startswith('db_keyword_intent__'))
+            elif feature == 'intent_surge':
+                events = intent_events.filter(col('event_type').startswith('intent_surge__'))
+            else:
+                raise ValueError(f'Unknown feature: {feature}')
+
+            events_transformed = model.transform(
+                events.join(accounts_cleaned.select('tenant_id', 'account_id'),
+                            on=['tenant_id', 'account_id'], how='inner')
+            )
+            rolled_up_events = rolled_up_events.unionByName(events_transformed)\
+                if rolled_up_events else events_transformed
+
+        return rolled_up_events
 
     @staticmethod
     def combine_events(accounts: DataFrame, firmo_events: DataFrame, opp_events: DataFrame,
-                       intent_events: DataFrame, activities_rollup: DataFrame) -> DataFrame:
+                       intent_activities_rollup: DataFrame) -> DataFrame:
         # Gather all events for the account list into one dataframe
         all_events = None
-        for df in [firmo_events, opp_events, intent_events, activities_rollup]:
+        for df in [firmo_events, opp_events, intent_activities_rollup]:
             df = df.join(accounts.select('tenant_id', 'account_id'), on=['tenant_id', 'account_id'], how='inner')
             all_events = all_events.unionByName(df) if all_events else df
         return all_events.filter(col('event_type').isNotNull())\
