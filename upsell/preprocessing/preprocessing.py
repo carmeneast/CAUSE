@@ -1,3 +1,4 @@
+import re
 from itertools import chain
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql.functions import *
@@ -222,6 +223,8 @@ class CausePreprocessing:
             .union(neg_w_none)\
             .select('tenant_id', 'account_id')
 
+        print(f'Total sample size: {n_pos + n_neg_w_act + n_neg_w_int + n_neg_w_none}')
+
         # Join back to accounts, which has account-level fields like firmographics
         return account_sample.join(accounts, on=['tenant_id', 'account_id'], how='inner')
 
@@ -330,6 +333,7 @@ class CausePreprocessing:
         cat_events = None
         for feat in ['country', 'industry', 'revenue_range', 'initial_journey_stage']:
             feat_df = accounts.select('tenant_id', 'account_id', feat)\
+                .filter(col(feat).isNotNull())\
                 .withColumn('dt', lit(0))\
                 .withColumn('event_type', concat(lit(f'{feat}__'), col(feat)))\
                 .withColumn('weight', lit(1))\
@@ -418,13 +422,12 @@ class CausePreprocessing:
         event_type_dict = self.event_type_rollup.rdd \
             .map(lambda x: {x['feature']: x['event_types']}) \
             .reduce(lambda x, y: {**x, **y})
-        print(event_type_dict)
 
         rolled_up_events = None
 
         for feat in event_type_dict.keys():
             print(f'Applying event type roll-up to {feat}...')
-            print(len(event_type_dict[feat]), event_type_dict[feat])
+            print(len(event_type_dict[feat]), event_type_dict[feat][:5])
             model = HierarchicalEventTypeRollUpModel(self.CONFIG.seed, event_type_dict[feat])
 
             if feat == 'activities':
@@ -483,7 +486,8 @@ class CausePreprocessing:
     def convert_to_sparse_matrices(self, padded_event_agg: DataFrame) -> DataFrame:
         event_type_names_list = self.event_type_names.coalesce(1).rdd.map(lambda x: x['event_type']).collect()
 
-        # The EMR notebook never works correctly with any UDF, so we have to do this the hard way below
+        # TODO: Fix this:
+        #   The EMR notebook never works correctly with any UDF, so we have to do this the hard way below
         # def sparse_vector(dt, event_type_map):
         #     # get (event_type index, weight) pairs for event_types that occurred on this date
         #     idx_weight_tuples = [(i+1, event_type_map[event]) for i, event in enumerate(event_type_names_list)
@@ -497,7 +501,9 @@ class CausePreprocessing:
 
         # Explode each feature into its own column
         for feat in event_type_names_list:
-            padded_event_agg = padded_event_agg.withColumn(feat, col('events').getItem(feat))
+            # Punctuation in column names will break the VectorAssembler, so replace with underscores
+            col_name = re.sub(r'[^a-zA-Z0-9_]+', '_', feat)
+            padded_event_agg = padded_event_agg.withColumn(col_name, col('events').getItem(feat))
         padded_event_agg = padded_event_agg.na.fill(0)
 
         # Convert to sparse vector
@@ -505,7 +511,7 @@ class CausePreprocessing:
         # using event_type_names, which is created from the training data.
         # Since event_type_names is saved during training, it's not necessary to save the VectorAssembler
         vec_assembler = VectorAssembler(
-            inputCols=['dt'] + event_type_names_list,
+            inputCols=['dt'] + [re.sub(r'[^a-zA-Z0-9_]+', '_', e) for e in event_type_names_list],
             outputCol='event_sparse_vector'
         )
 
