@@ -40,20 +40,20 @@ def pd_read_s3_multiple_files(bucket, key, file_suffix='.csv', verbose=False):
     return final
 
 
-def s3_key(tenant_id, run_date, sampling=None):
-    if sampling:
-        return f'upsell/{tenant_id}/{run_date}/{sampling}/'
+def s3_key(tenant_id, run_date, model_id=None):
+    if model_id:
+        return f'upsell/{tenant_id}/{run_date}/{model_id}/'
     else:
         return f'upsell/{tenant_id}/{run_date}/'
 
 
-def load_event_type_names(bucket, tenant_id, run_date, sampling=None):
-    key = s3_key(tenant_id, run_date, sampling)
+def load_event_type_names(bucket, tenant_id, run_date, model_id=None):
+    key = s3_key(tenant_id, run_date, model_id)
     return pd_read_s3_multiple_files(bucket, key+'event_type_names/', '.parquet')
 
 
-def load_numpy_data(bucket, tenant_id, run_date, sampling=None, dataset='train'):
-    key = s3_key(tenant_id, run_date, sampling)
+def load_numpy_data(bucket, tenant_id, run_date, model_id=None, dataset='train'):
+    key = s3_key(tenant_id, run_date, model_id)
     filename = f'{dataset}_model_data.npz'
     print(f'Loading s3://{bucket}/{key}{filename}')
     with BytesIO() as obj:
@@ -72,24 +72,24 @@ def load_numpy_data(bucket, tenant_id, run_date, sampling=None, dataset='train')
     }
 
 
-def save_pytorch_dataset(dataset, bucket, tenant_id, run_date, sampling, name):
-    key = s3_key(tenant_id, run_date, sampling)
+def save_pytorch_dataset(dataset, bucket, tenant_id, run_date, model_id, name):
+    key = s3_key(tenant_id, run_date, model_id)
     s3 = boto3.client('s3')
     buffer = BytesIO()
     torch.save(dataset.cpu().numpy(), buffer, pickle_protocol=4)
     s3.put_object(Bucket=bucket, Key=key+name+'.pt', Body=buffer.getvalue())
 
 
-def save_pytorch_model(model, bucket, tenant_id, run_date, sampling=None):
-    key = s3_key(tenant_id, run_date, sampling)
+def save_pytorch_model(model, bucket, tenant_id, run_date, model_id=None):
+    key = s3_key(tenant_id, run_date, model_id)
     s3 = boto3.client('s3')
     buffer = BytesIO()
     torch.save(model, buffer)
     s3.put_object(Bucket=bucket, Key=key+'model.pt', Body=buffer.getvalue())
 
 
-def load_pytorch_object(bucket, tenant_id, run_date, sampling, name):
-    key = s3_key(tenant_id, run_date, sampling)
+def load_pytorch_object(bucket, tenant_id, run_date, model_id, name):
+    key = s3_key(tenant_id, run_date, model_id)
     s3 = boto3.resource('s3')
     with BytesIO() as data:
         s3.Bucket(bucket).download_fileobj(key+name+'.pt', data)
@@ -98,8 +98,8 @@ def load_pytorch_object(bucket, tenant_id, run_date, sampling, name):
     return obj
 
 
-def save_attributions(df, bucket, tenant_id, run_date, sampling=None):
-    key = s3_key(tenant_id, run_date, sampling)
+def save_attributions(df, bucket, tenant_id, run_date, model_id=None):
+    key = s3_key(tenant_id, run_date, model_id)
     s3_resource = boto3.resource('s3')
     buffer = StringIO()
     df.to_csv(buffer, index=False, escapechar='\\')

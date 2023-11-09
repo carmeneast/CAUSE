@@ -21,20 +21,22 @@ class CausePreprocessing:
                  spark: SparkSession,
                  tenant_id: int,
                  run_date: str,
-                 sampling: str,
+                 model_id: Optional[str] = None,
                  bucket: str = 'ceasterwood',
                  weekly: bool = True
                  ):
         self.spark = spark
         self.tenant_id = tenant_id
         self.run_date = run_date
-        self.sampling = sampling
+        self.model_id = model_id
         self.bucket = bucket
         self.weekly = weekly
 
         self.CONFIG = load_yaml_config('upsell/config.yml').preprocessing
 
-        self.model_path = f'upsell/{self.tenant_id}/{self.run_date}/{self.sampling}'
+        self.model_path = f'upsell/{self.tenant_id}/{self.run_date}/'
+        if self.model_id:
+            self.model_path += f'{self.model_id}/'
         self.transformed_data_path = f's3://{self.bucket}/{self.model_path}'
 
         self.firmo_rollup: Optional[PipelineModel] = None

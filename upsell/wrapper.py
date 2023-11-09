@@ -18,7 +18,7 @@ from upsell.utils.s3 import load_event_type_names, load_numpy_data, load_pytorch
     save_pytorch_dataset, save_pytorch_model, save_attributions
 
 
-def init_env(tenant_id, run_date, bucket='ceasterwood', sampling=None):
+def init_env(tenant_id, run_date, bucket='ceasterwood', model_id=None):
     config = load_yaml_config('upsell/config.yml')
     set_rand_seed(config.env.seed, config.env.cuda)
     device = get_device(cuda=config.env.cuda)
@@ -26,9 +26,13 @@ def init_env(tenant_id, run_date, bucket='ceasterwood', sampling=None):
     config.tenant_id = tenant_id
     config.run_date = run_date
     config.bucket = bucket
-    config.sampling = sampling
+    config.model_id = model_id
 
-    event_type_names = load_event_type_names(config.bucket, config.tenant_id, config.run_date, config.sampling)
+    config.filepath = f'{config.tenant_id}/{config.run_date}/'
+    if config.model_id:
+        config.filepath += f'{config.model_id}/'
+
+    event_type_names = load_event_type_names(config.bucket, config.tenant_id, config.run_date, config.model_id)
     config.model.n_event_types = event_type_names.shape[0]
     config.attribution.event_type_names = event_type_names['event_type'].to_list()
     return device, config
@@ -36,7 +40,7 @@ def init_env(tenant_id, run_date, bucket='ceasterwood', sampling=None):
 
 def run(device, config, tune_params=True):
     # Get event sequences
-    train_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.sampling, dataset='train')
+    train_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.model_id, dataset='train')
 
     # Train model
     if tune_params:
@@ -45,21 +49,20 @@ def run(device, config, tune_params=True):
         train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, config.data_loader, dataset='train')
         untrained_model = init_model(config.model, device=device)
         model = train(train_data_loader, valid_data_loader, untrained_model, config.train,
-                      config.tenant_id, config.run_date, config.sampling, device=device, tune_params=False)
-        save_pytorch_model(model, config.bucket, config.tenant_id, config.run_date, config.sampling)
+                      config.tenant_id, config.run_date, config.model_id, config.filepath,
+                      device=device, tune_params=False)
+        save_pytorch_model(model, config.bucket, config.tenant_id, config.run_date, config.model_id)
 
     # Evaluate training history
-    history = pd.read_csv(f'{config.tenant_id}/{config.run_date}/{config.sampling}/history.csv')
-    plot_training_loss(history, tune_metric=config.train.tune_metric,
-                       filepath=f'{config.tenant_id}/{config.run_date}/{config.sampling}/training_loss.png')
+    history = pd.read_csv(f'{config.filepath}/history.csv')
+    plot_training_loss(history, tune_metric=config.train.tune_metric, filepath=f'{config.filepath}/training_loss.png')
 
     # Evaluate model on test set
-    test_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.sampling, dataset='test')
+    test_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.model_id, dataset='test')
     metrics = calculate_test_metrics(test_event_seqs, model, device, loader_configs=config.data_loader)
     pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
-        .to_json(f'{config.tenant_id}/{config.run_date}/{config.sampling}/test_metrics.json')
-    plot_avg_incidence_at_k(metrics, ks=model.ks,
-                            filepath=f'{config.tenant_id}/{config.run_date}/{config.sampling}/avg_incidence_at_k.png')
+        .to_json(f'{config.filepath}/test_metrics.json')
+    plot_avg_incidence_at_k(metrics, ks=model.ks, filepath=f'{config.filepath}/avg_incidence_at_k.png')
 
     # Calculate infectivity
     if not config.attribution.skip_eval_infectivity:
@@ -74,7 +77,7 @@ def run(device, config, tune_params=True):
         print(attribution_matrix.shape)
 
     # Predict future event intensities on test set
-    pred_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.sampling, dataset='pred')
+    pred_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.model_id, dataset='pred')
     intensities, cumulants = predict(
         pred_event_seqs,
         model,
@@ -85,7 +88,7 @@ def run(device, config, tune_params=True):
     for dataset, name in [(intensities, 'event_intensities'), (cumulants, 'event_cumulants')]:
         print(name, dataset.shape)
         save_pytorch_dataset(dataset, config.bucket, config.tenant_id,
-                             config.run_date, config.sampling, name)
+                             config.run_date, config.model_id, name)
 
 
 def get_device(cuda: bool, dynamic: bool = False):
@@ -99,9 +102,9 @@ def get_device(cuda: bool, dynamic: bool = False):
     return device
 
 
-def load_event_seqs(tenant_id, run_date, sampling=None, dataset='train'):
+def load_event_seqs(tenant_id, run_date, model_id=None, dataset='train'):
     bucket = 'ceasterwood'
-    data = load_numpy_data(bucket, tenant_id, run_date, sampling, dataset)
+    data = load_numpy_data(bucket, tenant_id, run_date, model_id, dataset)
     event_seqs = data['event_seqs']
 
     if dataset == 'test':
@@ -171,7 +174,7 @@ def init_model(model_configs, device=None):
     return model
 
 
-def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date, sampling,
+def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date, model_id, filepath,
           device=None, tune_params=True):
     bucket = 'ceasterwood'
     patience = train_configs['patience'] if tune_params else train_configs.patience.no_tuning
@@ -266,7 +269,7 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
             best_epoch = epoch
             best_metric = valid_metrics[tune_metric].avg
             if not tune_params:
-                save_pytorch_model(model, bucket, tenant_id, run_date, sampling)
+                save_pytorch_model(model, bucket, tenant_id, run_date, model_id)
 
         if epoch - best_epoch >= patience:
             print(f'Stopped training early at epoch {epoch}: ' +
@@ -275,22 +278,22 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
 
     if not tune_params:
         # Reset model to the last-saved (best) version of the model
-        model = load_pytorch_object(bucket, tenant_id, run_date, sampling, 'model')
+        model = load_pytorch_object(bucket, tenant_id, run_date, model_id, 'model')
 
         # Save training history
-        history.to_csv(f'{tenant_id}/{run_date}/{sampling}/history.csv', index=False)
+        history.to_csv(f'{filepath}/history.csv', index=False)
 
     return model
 
 
 def train_with_tuning(device, config):
-    def __train_with_tuning(__search_space, tenant_id, run_date, sampling):
-        train_event_seqs = load_event_seqs(tenant_id, run_date, sampling, dataset='train')
+    def __train_with_tuning(__search_space, tenant_id, run_date, model_id, filepath):
+        train_event_seqs = load_event_seqs(tenant_id, run_date, model_id, dataset='train')
         train_data_loader, valid_data_loader = init_data_loader(
             train_event_seqs, __search_space['data_loader'], dataset='train')
         untrained_model = init_model(__search_space['model'])
         _ = train(train_data_loader, valid_data_loader, untrained_model, __search_space['train'],
-                  tenant_id, run_date, sampling, tune_params=True)
+                  tenant_id, run_date, model_id, filepath, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
@@ -333,7 +336,8 @@ def train_with_tuning(device, config):
         reduction_factor=config.tuning.reduction_factor,
     )
     result = tune.run(
-        partial(__train_with_tuning, tenant_id=config.tenant_id, run_date=config.run_date, sampling=config.sampling),
+        partial(__train_with_tuning, tenant_id=config.tenant_id, run_date=config.run_date,
+                model_id=config.model_id, filepath=config.filepath),
         # resources_per_trial={'cpu': 8, 'gpu': 0},
         config=search_space,
         num_samples=config.tuning.n_param_combos,
@@ -352,7 +356,7 @@ def train_with_tuning(device, config):
     best_model.load_state_dict(best_checkpoint_data['model_state_dict'])
 
     # Save results from best trial
-    save_pytorch_model(best_model, config.bucket, config.tenant_id, config.run_date, config.sampling)
+    save_pytorch_model(best_model, config.bucket, config.tenant_id, config.run_date, config.model_id)
     best_checkpoint_data['history'].to_csv(f'{config.tenant_id}/{config.run_date}/history.csv', index=False)
 
     return best_model
@@ -413,7 +417,7 @@ if __name__ == '__main__':
     TENANT_ID = 1309
     RUN_DATE = '2023-07-01'
     BUCKET = 'ceasterwood'
-    SAMPLING = None
+    MODEL_ID = None
 
-    DEVICE, CONFIG = init_env(TENANT_ID, RUN_DATE, BUCKET, SAMPLING)
+    DEVICE, CONFIG = init_env(TENANT_ID, RUN_DATE, BUCKET, MODEL_ID)
     run(DEVICE, CONFIG, tune_params=True)

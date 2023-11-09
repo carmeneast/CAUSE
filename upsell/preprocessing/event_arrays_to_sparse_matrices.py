@@ -26,8 +26,8 @@ def convert_to_series_of_sparse_matrices(event_df):
     return events_by_account[['tenant_id', 'account_id']], event_seqs
 
 
-def create_save_event_seqs(bucket, tenant_id, run_date, sampling=None, dataset='train'):
-    key = s3_key(tenant_id, run_date, sampling)
+def create_save_event_seqs(bucket, tenant_id, run_date, model_id=None, dataset='train'):
+    key = s3_key(tenant_id, run_date, model_id)
     events = pd_read_s3_multiple_files(bucket, key+f'{dataset}_sparse_matrices/', '.parquet')
     print('events', events.shape)
 
