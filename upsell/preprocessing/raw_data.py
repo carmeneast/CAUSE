@@ -78,6 +78,7 @@ class RawEvents:
         accounts = spark.sql(account_query)
 
         # Get account's first journey stage
+        # TODO: Calculate OOB journey stage on this date
         journey_query = f"""
         WITH first_stage_dt AS (
             -- First date we started collecting data on the account
@@ -219,7 +220,7 @@ class RawEvents:
                 '__',
                 REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(_per_role)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_'),
                 '__',
-                REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(category___e)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_'),
+                TRIM(LOWER(category___e)) -- don't change punctuation on category since this is the webpage URL
             ) AS event_type
             , COUNT(*) AS weight
         FROM db1_data_warehouse.tenant.activity_bundle
@@ -241,7 +242,7 @@ class RawEvents:
                 '__',
                 REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(_per_role)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_'),
                 '__',
-                REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(category___e)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_'),
+                REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(category___e)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_')
             ) AS event_type
             , COUNT(*) AS weight
         FROM db1_data_warehouse.tenant.activity_bundle
@@ -258,7 +259,7 @@ class RawEvents:
 
     def get_intent_events(self) -> DataFrame:
         # TODO: Add activity_source_type = 'trending_intent'
-        # TODO: Check if we can get the specific keyword for intent surge events
+        # TODO: Look into using the specific keyword for intent surge events
         intent_surge_query = f"""
         SELECT tenant_id
             , account_id
@@ -268,7 +269,7 @@ class RawEvents:
                 '__',
                 REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(_per_role)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_'),
                 '__',
-                REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(category___e)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_'),
+                REGEXP_REPLACE(REGEXP_REPLACE(TRIM(LOWER(category___e)), '[^a-zA-Z0-9_ ]+', ''), ' ', '_')
             ) AS event_type
             , COUNT(*) AS weight
         FROM db1_data_warehouse.tenant.activity_bundle
@@ -301,11 +302,11 @@ class RawEvents:
             # TODO: Instead of creating events like db_keyword_intent__other__high (activity, role, category),
             #     do db_keyword_intent__high__<keyword> (activity, category, keyword)
             return keyword_intent_df \
-                .select('tenant_id', 'account_id', 'activity_date', f'${_strength}_intent_keywords') \
-                .withColumn('keyword', explode(col(f'${_strength}_intent_keywords'))) \
-                .drop(f'${_strength}_intent_keyword') \
+                .select('tenant_id', 'account_id', 'activity_date', f'{_strength}_intent_keywords') \
+                .withColumn('keyword', explode(col(f'{_strength}_intent_keywords'))) \
+                .drop(f'{_strength}_intent_keyword') \
                 .distinct() \
-                .withColumn('event_type', lit(f'db_keyword_intent__other__${_strength}')) \
+                .withColumn('event_type', lit(f'db_keyword_intent__other__{_strength}')) \
                 .groupBy('tenant_id', 'account_id', 'activity_date', 'event_type') \
                 .agg(count('keyword').alias('weight'))
 
@@ -317,12 +318,19 @@ class RawEvents:
     @staticmethod
     def calculate_metrics(accounts: DataFrame, activities: DataFrame, opp_events: DataFrame,
                           intent_events: DataFrame) -> DataFrame:
-        t = accounts.select('tenant_id').distinct()
-        n = accounts.agg(count('*').alias('accounts'))
+        # Drop events for accounts not in CRM
+        activities = activities.join(accounts, on=['tenant_id', 'account_id'], how='inner')
+        opp_events = opp_events.join(accounts, on=['tenant_id', 'account_id'], how='inner')
+        intent_events = intent_events.join(accounts, on=['tenant_id', 'account_id'], how='inner')
+
+        # Get event counts
+        tenant_id = accounts.select('tenant_id').distinct()
         n_activities = activities.agg(sum('weight').alias('activities')).na.fill(0)
         n_opp_events = opp_events.agg(sum('weight').alias('oppEvents')).na.fill(0)
         n_intent_events = intent_events.agg(sum('weight').alias('intentEvents')).na.fill(0)
 
+        # Get account counts
+        n = accounts.agg(count('*').alias('accounts'))
         n_acct_w_activity = activities.agg(countDistinct('account_id').alias('accountsWithActivity'))
         n_acct_w_opp = opp_events.agg(countDistinct('account_id').alias('accountsWithOppEvent'))
         n_acct_w_intent = intent_events.agg(countDistinct('account_id').alias('accountsWithIntentEvent'))
@@ -338,7 +346,8 @@ class RawEvents:
             .filter(col('weight').isNull()) \
             .agg(count('*').alias('accountsWithNoEvents'))
 
-        return t.join(n) \
+        # Join all metrics
+        return tenant_id.join(n) \
             .join(n_activities) \
             .join(n_opp_events) \
             .join(n_intent_events) \
@@ -387,11 +396,13 @@ if __name__ == '__main__':
     # Create datasets for each tenant and save to S3
     all_metrics = None
     for TENANT_ID in TENANT_IDS:
+        print(f'=== {TENANT_ID} ===')
         raw_events = RawEvents(TENANT_ID, RUN_DATE, ACTIVITY_MONTHS, INTENT_MONTHS, BUCKET)
         raw_events.main()
 
         # Combine metrics datasets
         tenant_metrics = spark.read.json(f's3://{BUCKET}/upsell/{TENANT_ID}/{RUN_DATE}/metrics/events/')
+        tenant_metrics.show()
 
         all_metrics = all_metrics.unionByName(tenant_metrics) if all_metrics else tenant_metrics
 

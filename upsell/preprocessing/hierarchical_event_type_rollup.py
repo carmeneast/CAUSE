@@ -25,6 +25,10 @@ def roll_up_event_type(event_type_col: Column, level: int) -> Column:
 
 
 class HierarchicalEventTypeRollUp(Estimator, DefaultParamsReadable, DefaultParamsWritable):
+    """
+    Keep events that meet certain conditions as-is and roll other events up to higher levels until
+    they meet the required conditions
+    """
 
     def __init__(self, min_accounts: int = 50, min_occurrences: int = 100):
         super().__init__()
@@ -101,10 +105,10 @@ class HierarchicalEventTypeRollUpModel(Model, DefaultParamsReadable, DefaultPara
         self.uid = uid
         self.event_types = event_types
 
-    def _transform(self, df: DataFrame) -> DataFrame:
-        validate_event_df_schema(df.schema)
+    def _transform(self, event_df: DataFrame) -> DataFrame:
+        validate_event_df_schema(event_df.schema)
 
-        return df\
+        return event_df\
             .withColumn('rollup0', roll_up_event_type(col('event_type'), level=0))\
             .withColumn('rollup1', roll_up_event_type(col('event_type'), level=1))\
             .withColumn('rollup2', roll_up_event_type(col('event_type'), level=2))\

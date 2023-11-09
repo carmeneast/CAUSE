@@ -9,8 +9,9 @@ from typing import Dict, List, Optional, Tuple
 
 from upsell.configs import load_yaml_config
 from upsell.preprocessing.country_map import COUNTRY_MAP
-from upsell.preprocessing.top_n_rollup import TopNCategoryRollUp, TopNCategoryRollUpModel
-from upsell.preprocessing.event_type_rollup import HierarchicalEventTypeRollUp, HierarchicalEventTypeRollUpModel
+from upsell.preprocessing.flat_event_type_rollup import FlatEventTypeRollUp, FlatEventTypeRollUpModel
+from upsell.preprocessing.hierarchical_event_type_rollup import HierarchicalEventTypeRollUp,\
+    HierarchicalEventTypeRollUpModel
 
 
 class CausePreprocessing:
@@ -19,24 +20,24 @@ class CausePreprocessing:
                  spark: SparkSession,
                  tenant_id: int,
                  run_date: str,
-                 # sampling: str,
+                 sampling: str,
                  bucket: str = 'ceasterwood',
                  weekly: bool = True
                  ):
         self.spark = spark
         self.tenant_id = tenant_id
         self.run_date = run_date
-        # self.sampling = sampling
+        self.sampling = sampling
         self.bucket = bucket
         self.weekly = weekly
 
         self.CONFIG = load_yaml_config('upsell/config.yml').preprocessing
 
-        self.model_path = f'upsell/{self.tenant_id}/{self.run_date}/'  # {self.sampling}'
+        self.model_path = f'upsell/{self.tenant_id}/{self.run_date}/{self.sampling}'
         self.transformed_data_path = f's3://{self.bucket}/{self.model_path}'
 
         self.firmo_rollup: Optional[PipelineModel] = None
-        self.firmo_categories: Optional[Dict[str, List[str]]] = None
+        self.firmo_event_types: Optional[Dict[str, List[str]]] = None
         self.event_type_rollup: Optional[DataFrame] = None
         self.n_event_types = None
         self.event_type_names = None
@@ -45,7 +46,6 @@ class CausePreprocessing:
         # Load raw event data
         print('Loading raw event data...')
         raw_data_path = f's3://{self.bucket}/upsell/{self.tenant_id}/{self.run_date}'
-        transformed_data_path = f'{raw_data_path}/'  # {self.sampling}'
 
         accounts = self.spark.read.parquet(f'{raw_data_path}/accounts')
         activities = self.spark.read.parquet(f'{raw_data_path}/activities')
@@ -61,22 +61,22 @@ class CausePreprocessing:
         if dataset == 'train':
             print('Sampling accounts...')
             account_sample = self.sample_accounts(accounts, activity_events, opp_events, intent_events)
-            self.save_parquet(account_sample, f'{transformed_data_path}/account_sample')
+            self.save_parquet(account_sample, f'{self.transformed_data_path}/account_sample')
 
             print('Splitting into train/test...')
             train_accounts, test_accounts = self.train_test_split(account_sample)
-            self.save_parquet(train_accounts, f'{transformed_data_path}/train_accounts')
-            self.save_parquet(test_accounts, f'{transformed_data_path}/test_accounts')
+            self.save_parquet(train_accounts, f'{self.transformed_data_path}/train_accounts')
+            self.save_parquet(test_accounts, f'{self.transformed_data_path}/test_accounts')
 
             accounts = train_accounts
 
         elif dataset == 'test':
-            accounts = self.spark.read.parquet(f'{transformed_data_path}/test_accounts')
+            accounts = self.spark.read.parquet(f'{self.transformed_data_path}/test_accounts')
 
         print(f'Preprocessing {dataset} data...')
         sparse_matrices = self.apply_preprocessing(accounts, activity_events, opp_events, intent_events,
                                                    dataset=dataset)
-        self.save_parquet(sparse_matrices, f'{transformed_data_path}/{dataset}_sparse_matrices')
+        self.save_parquet(sparse_matrices, f'{self.transformed_data_path}/{dataset}_sparse_matrices')
 
     def apply_preprocessing(self, accounts: DataFrame, activity_events: DataFrame,
                             opp_events: DataFrame, intent_events: DataFrame, dataset: str = 'train'):
@@ -87,9 +87,9 @@ class CausePreprocessing:
         if dataset == 'train':
             # Fit firmographic roll-up
             print('Fitting firmographic roll-up...')
-            self.firmo_rollup, self.firmo_categories = self.fit_firmographic_roll_up(accounts_cleaned)
+            self.firmo_rollup, self.firmo_event_types = self.fit_firmographic_roll_up(accounts_cleaned)
             self.firmo_rollup.write().overwrite().save(f'{self.transformed_data_path}/firmo_rollup_pipeline')
-            self.save_json(self.firmo_categories, f'{self.transformed_data_path}/firmo_categories')
+            self.save_json(self.firmo_event_types, f'{self.transformed_data_path}/firmo_event_types')
 
             # Fit activity + intent roll-up
             print('Fitting activity + intent event roll-up...')
@@ -104,18 +104,18 @@ class CausePreprocessing:
             # Load roll-ups
             print('Loading preprocessors...')
             self.firmo_rollup = PipelineModel.load(f'{self.transformed_data_path}/firmo_rollup_pipeline')
-            self.firmo_categories = self.spark.read.json(f'{self.transformed_data_path}/firmo_categories')
+            self.firmo_event_types = self.spark.read.json(f'{self.transformed_data_path}/firmo_event_types')
             self.event_type_rollup = self.spark.read.json(f'{self.transformed_data_path}/event_type_rollup_pipeline')
 
         # Roll up firmographics and activities
         print('Rolling up firmographics...')
         accounts_transformed = self.firmo_rollup.transform(accounts_cleaned)
-        categories = self.firmo_categories.rdd\
-            .map(lambda x: {x['feature']: x['categories']})\
+        firmo_event_type_dict = self.firmo_event_types.rdd\
+            .map(lambda x: {x['feature']: x['event_types']})\
             .reduce(lambda x, y: {**x, **y})
-        print(categories)
-        for feat in categories.keys():
-            model = TopNCategoryRollUpModel(self.CONFIG.seed, feat, feat, categories[feat])
+        print(firmo_event_type_dict)
+        for feat in firmo_event_type_dict.keys():
+            model = FlatEventTypeRollUpModel(self.CONFIG.seed, feat, feat, firmo_event_type_dict[feat])
             accounts_transformed = model.transform(accounts_transformed)
 
         print('Rolling up activities...')
@@ -237,15 +237,6 @@ class CausePreprocessing:
         print(f'Test accounts: {test.count()}')
         return train, test
 
-    @staticmethod
-    def clean_event_type_names(event_type_col: Column) -> Column:
-        return regexp_replace(
-            regexp_replace(
-                regexp_replace(trim(lower(event_type_col)), '[^a-zA-Z0-9\\|_ ]+', ''),  # remove punctuation
-                ' ', '_'  # replace spaces with underscores
-            ), '\\|', '__'  # replace pipes with double underscores
-        )
-
     def create_timeline_events(self, accounts: DataFrame, raw_events: DataFrame):
         # 1. Filter to events that occurred between the account's start date and the run date
         # 2. Convert dates to a value on a number line, where the account's start date is 0
@@ -254,7 +245,6 @@ class CausePreprocessing:
             .join(accounts.select('tenant_id', 'account_id', 'start_dt'), on=['tenant_id', 'account_id'])\
             .filter((col('start_dt') <= col('activity_date')) & (col('activity_date') <= lit(self.run_date)))\
             .withColumn('dt', datediff(col('activity_date'), col('start_dt')) + lit(1))\
-            .withColumn('event_type', self.clean_event_type_names(col('event_type')))\
             .select('tenant_id', 'account_id', 'dt', 'event_type', 'weight')
 
         if self.weekly:
@@ -335,8 +325,8 @@ class CausePreprocessing:
     def create_firmographic_events(accounts: DataFrame) -> DataFrame:
         # All firmographic features occur at time 0
         # Stack categorical features as events at start_dt
-        # | account_id | country | --> BECOMES --> | account_id | dt | event_type | weight |
-        # |        123 |      US | --------------> |        123 |  0 | country=US |      1 |
+        # | account_id | country | --> BECOMES --> | account_id | dt | event_type  | weight |
+        # |        123 |      us | --------------> |        123 |  0 | country__us |      1 |
         cat_events = None
         for feat in ['country', 'industry', 'revenue_range', 'initial_journey_stage']:
             feat_df = accounts.select('tenant_id', 'account_id', feat)\
@@ -357,24 +347,29 @@ class CausePreprocessing:
                 .withColumnRenamed(feat, 'weight')
             num_events = num_events.union(feat_df) if num_events is not None else feat_df
 
-        return cat_events.unionByName(num_events).select('tenant_id', 'account_id', 'dt', 'event_type', 'weight')
+        return cat_events.unionByName(num_events)\
+            .select('tenant_id', 'account_id', 'dt', 'event_type', 'weight')
 
     def fit_firmographic_roll_up(self, train_accounts: DataFrame) -> Tuple[PipelineModel, DataFrame]:
         transformers = []
-        feat_categories = []
+        feat_event_types = []
 
         # Keep the top categories for categorical features
         for feat in ['country', 'industry', 'revenue_range', 'initial_journey_stage']:
-            if feat in ['country', 'industry']:
-                # Keep top N categories
-                n = self.CONFIG.firmo_rollup.top_n_categories
-            else:
-                # Keep all categories
-                n = train_accounts.select(feat).filter(col(feat).isNotNull()).distinct().count()
-            transformer = TopNCategoryRollUp(input_col=feat, output_col=feat, n_categories=n)
+            n = self.CONFIG.event_rollup.journeys.min_accounts if feat == 'initial_journey_stage' \
+                else self.CONFIG.event_rollup.default.min_accounts
+            frac = self.CONFIG.event_rollup.default.min_pct_accounts if feat in ['country', 'industry'] \
+                else None
+
+            transformer = FlatEventTypeRollUp(
+                input_col=feat,
+                output_col=feat,
+                min_accounts=n,
+                min_pct_accounts=frac
+            )
             # transformers.append(transformer)
-            categories = transformer.fit(train_accounts).categories
-            feat_categories.append((feat, categories))
+            event_types = transformer.fit(train_accounts).event_types
+            feat_event_types.append((feat, event_types))
 
         # Impute missing values for numeric features
         for feat in ['ln_employees']:
@@ -383,7 +378,7 @@ class CausePreprocessing:
 
         firmo_rollup = Pipeline(stages=transformers)
         return (firmo_rollup.fit(train_accounts),
-                self.spark.createDataFrame(feat_categories, schema=['feature', 'categories']))
+                self.spark.createDataFrame(feat_event_types, schema=['feature', 'event_types']))
 
     def fit_event_type_roll_up(self, train_activities: DataFrame, train_intent_events: DataFrame) -> DataFrame:
         activity_transformer = HierarchicalEventTypeRollUp(
@@ -399,7 +394,7 @@ class CausePreprocessing:
             min_accounts=self.CONFIG.event_rollup.default.min_accounts,
         )
         kwd_intent = kwd_transformer.fit(
-            train_intent_events.filter(col('event_type').startswith('DB Keyword Intent|'))
+            train_intent_events.filter(col('event_type').startswith('db_keyword_intent__'))
         ).event_types
 
         surge_transformer = HierarchicalEventTypeRollUp(
@@ -407,35 +402,37 @@ class CausePreprocessing:
             min_accounts=self.CONFIG.event_rollup.intent_surge.min_accounts,
         )
         intent_surge = surge_transformer.fit(
-            train_intent_events.filter(col('event_type').startswith('Intent Surge|'))
+            train_intent_events.filter(col('event_type').startswith('intent_surge__'))
         ).event_types
         return self.spark.createDataFrame(
             [
                 ('activities', activities),
-                ('kwd_intent', kwd_intent),
+                ('db_keyword_intent', kwd_intent),
                 ('intent_surge', intent_surge)
             ],
-            schema=['feature', 'categories']
+            schema=['feature', 'event_types']
         )
 
     def apply_event_type_roll_up(self, accounts_cleaned: DataFrame, activity_events: DataFrame,
                                  intent_events: DataFrame) -> DataFrame:
-        rolled_up_events = None
-        for feature in ['activities', 'kwd_intent', 'intent_surge']:
-            print(f'Applying event type roll-up to {feature}...')
-            categories = self.event_type_rollup.filter(col('feature') == feature) \
-                .rdd.map(lambda x: x['categories']).collect()[0]
-            print(len(categories), categories[:5])
-            model = HierarchicalEventTypeRollUpModel(self.CONFIG.seed, categories)
+        event_type_dict = self.event_type_rollup.rdd \
+            .map(lambda x: {x['feature']: x['event_types']}) \
+            .reduce(lambda x, y: {**x, **y})
+        print(event_type_dict)
 
-            if feature == 'activities':
+        rolled_up_events = None
+
+        for feat in event_type_dict.keys():
+            print(f'Applying event type roll-up to {feat}...')
+            print(len(event_type_dict[feat]), event_type_dict[feat])
+            model = HierarchicalEventTypeRollUpModel(self.CONFIG.seed, event_type_dict[feat])
+
+            if feat == 'activities':
                 events = activity_events
-            elif feature == 'kwd_intent':
-                events = intent_events.filter(col('event_type').startswith('db_keyword_intent__'))
-            elif feature == 'intent_surge':
-                events = intent_events.filter(col('event_type').startswith('intent_surge__'))
+            elif feat in ['db_keyword_intent', 'intent_surge']:
+                events = intent_events.filter(col('event_type').startswith(f'{feat}__'))
             else:
-                raise ValueError(f'Unknown feature: {feature}')
+                raise ValueError(f'Unknown feature: {feat}')
 
             events_transformed = model.transform(
                 events.join(accounts_cleaned.select('tenant_id', 'account_id'),

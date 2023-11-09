@@ -11,17 +11,15 @@ preprocessing:
     neg_w_intent_prop: 4
     neg_w_none_prop: 4
   event_rollup:
-    activities:  # activities, DB keyword intent
+    default:  # activities, DB keyword intent, country, industry, revenue_range
       min_accounts: 100
       min_occurrences: 150
+      min_pct_accounts: 0.025
     intent_surge:  # rare but important
       min_accounts: 20
       min_occurrences: 30
     journeys:  # TODO: this should be revised once we calculate OOB journeys for all accounts
       min_accounts: 20
-    firmographics:  # country, industry, revenue_range
-      min_accounts: 200
-      pos_frac: 0.75
   train_size: 0.8
 
 data_loader:
