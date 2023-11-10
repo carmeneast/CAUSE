@@ -340,6 +340,9 @@ class CausePreprocessing:
                 .withColumn('event_type', concat(lit(f'{feat}__'), col(feat)))\
                 .withColumn('weight', lit(1))\
                 .drop(feat)
+
+            feat_df.groupBy('event_type').count().orderBy('event_type').show(20, False)
+
             cat_events = cat_events.unionByName(feat_df) if cat_events is not None else feat_df
 
         # Set numeric feature values as the weight
