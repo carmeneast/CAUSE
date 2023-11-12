@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from functools import partial
 from ray import tune
-from ray.air import Checkpoint, session
+from ray.air import session
+from ray.train import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
 from torch.utils.data import DataLoader
 
@@ -14,7 +15,7 @@ from upsell.metric_tracker import MetricTracker
 from upsell.rnn import ExplainableRecurrentPointProcess
 from upsell.utils.data_loader import split_data_loader, convert_to_bucketed_data_loader
 from upsell.utils.env import get_freer_gpu, set_rand_seed
-from upsell.utils.s3 import load_event_type_names, load_numpy_data, load_pytorch_object,\
+from upsell.utils.s3 import load_event_type_names, load_numpy_data, load_pytorch_object, \
     save_pytorch_dataset, save_pytorch_model, save_attributions
 
 
@@ -73,7 +74,7 @@ def run(device, config, tune_params=True):
             loader_configs=config.data_loader,
             attribution_configs=config.attribution
         )
-        save_attributions(attribution_matrix, config.bucket, config.tenant_id, config.run_date)
+        save_attributions(attribution_matrix, config.bucket, config.tenant_id, config.run_date, config.model_id)
         print(attribution_matrix.shape)
 
     # Predict future event intensities on test set
@@ -117,7 +118,7 @@ def load_event_seqs(tenant_id, run_date, model_id=None, dataset='train'):
 def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribution: bool = False):
     if attribution:
         batch_size = loader_configs.attr_batch_size
-    elif type(loader_configs['batch_size']) == int:
+    elif isinstance(loader_configs['batch_size'], int):
         batch_size = loader_configs['batch_size']
     else:
         batch_size = loader_configs.batch_size.default
@@ -157,12 +158,12 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
 def init_model(model_configs, device=None):
     model = ExplainableRecurrentPointProcess(
         n_event_types=model_configs['n_event_types'],
-        embedding_dim=model_configs['embedding_dim'] if type(model_configs['embedding_dim']) == int
+        embedding_dim=model_configs['embedding_dim'] if isinstance(model_configs['embedding_dim'], int)
         else model_configs.embedding_dim.default,
-        hidden_size=model_configs['hidden_size'] if type(model_configs['hidden_size']) == int
+        hidden_size=model_configs['hidden_size'] if isinstance(model_configs['hidden_size'], int)
         else model_configs.hidden_size.default,
         rnn=model_configs['rnn'],
-        dropout=model_configs['dropout'] if type(model_configs['dropout']) == float
+        dropout=model_configs['dropout'] if isinstance(model_configs['dropout'], float)
         else model_configs.dropout.default,
         basis_type=model_configs['basis_type'],
         basis_means=model_configs['basis_means'],
@@ -184,7 +185,7 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
         model.to(device)
 
     optimizer = getattr(torch.optim, train_configs['optimizer'])(
-        model.parameters(), lr=train_configs['lr'] if type(train_configs['lr']) == float
+        model.parameters(), lr=train_configs['lr'] if isinstance(train_configs['lr'], float)
         else train_configs.lr.default
     )
 
@@ -226,7 +227,7 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
             for metric in model.metrics:
                 n = eval(f'{loss_type}_metrics')[metric].count
                 val = eval(f'{loss_type}_metrics')[metric].avg
-                if type(val) == torch.Tensor:
+                if isinstance(val, torch.Tensor):
                     val = val.item()
                 epoch_metrics[loss_type][metric].update(val, n=n)
         end = datetime.now()

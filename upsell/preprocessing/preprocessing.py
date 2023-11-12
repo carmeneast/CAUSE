@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from upsell.configs import load_yaml_config
 from upsell.preprocessing.country_map import COUNTRY_MAP
 from upsell.preprocessing.flat_event_type_rollup import FlatEventTypeRollUp, FlatEventTypeRollUpModel
-from upsell.preprocessing.hierarchical_event_type_rollup import HierarchicalEventTypeRollUp,\
+from upsell.preprocessing.hierarchical_event_type_rollup import HierarchicalEventTypeRollUp, \
     HierarchicalEventTypeRollUpModel
 
 
@@ -120,6 +120,7 @@ class CausePreprocessing:
         for feat in firmo_event_type_dict.keys():
             model = FlatEventTypeRollUpModel(self.CONFIG.seed, feat, feat, firmo_event_type_dict[feat])
             accounts_transformed = model.transform(accounts_transformed)
+        accounts_transformed.cache()
 
         print('Rolling up activities...')
         rolled_up_events = self.apply_event_type_roll_up(accounts_cleaned, activity_events, intent_events)
@@ -190,7 +191,7 @@ class CausePreprocessing:
             .withColumn('rand', rand(seed=self.CONFIG.seed))
 
         # Get positive accounts
-        pos = account_types.filter(col('open_opp') == 1)\
+        pos = account_types.filter(col('open_opp') == lit(1))\
             .orderBy('rand')\
             .limit(self.CONFIG.sampling.max_positives)
         n_pos = pos.count()
@@ -199,23 +200,23 @@ class CausePreprocessing:
         # Get negative accounts
         # Negatives with activity
         n_neg_w_act = n_pos * self.CONFIG.sampling.neg_w_activity_prop
-        neg_w_act = account_types.filter((col('open_opp') == 0) & (col('has_activity') == 1))\
+        neg_w_act = account_types.filter((col('open_opp') == lit(0)) & (col('has_activity') == lit(1)))\
             .orderBy('rand')\
             .limit(n_neg_w_act)
         has_enough_accounts(neg_w_act, n_neg_w_act, 'negative accounts w/ activity')
 
         # Negatives with intent only
         n_neg_w_int = n_pos * self.CONFIG.sampling.neg_w_intent_prop
-        neg_w_int = account_types.filter((col('open_opp') == 0) & (col('has_activity') == 0) &
-                                         (col('has_intent') == 1))\
+        neg_w_int = account_types.filter((col('open_opp') == lit(0)) & (col('has_activity') == lit(0)) &
+                                         (col('has_intent') == lit(1)))\
             .orderBy('rand')\
             .limit(n_neg_w_int)
         has_enough_accounts(neg_w_int, n_neg_w_int, 'negative accounts w/ intent only')
 
         # Negatives with no activity or intent
         n_neg_w_none = n_pos * self.CONFIG.sampling.neg_w_none_prop
-        neg_w_none = account_types.filter((col('open_opp') == 0) & (col('has_activity') == 0) &
-                                          (col('has_intent') == 0))\
+        neg_w_none = account_types.filter((col('open_opp') == lit(0)) & (col('has_activity') == lit(0)) &
+                                          (col('has_intent') == lit(0)))\
             .orderBy('rand')\
             .limit(n_neg_w_none)
         has_enough_accounts(neg_w_none, n_neg_w_none, 'negative accounts w/o activity or intent')
@@ -254,7 +255,7 @@ class CausePreprocessing:
 
         if self.weekly:
             # Convert days values to week values and re-aggregate
-            timeline_event = timeline_event.withColumn('dt', ceil(col('dt') / 7))\
+            timeline_event = timeline_event.withColumn('dt', ceil(col('dt') / lit(7)))\
                 .groupBy('tenant_id', 'account_id', 'dt', 'event_type')\
                 .agg(sum('weight').alias('weight'))
 
@@ -286,7 +287,7 @@ class CausePreprocessing:
             return when(~cleaned_col.isin(['', 'unclassified']), cleaned_col)
 
         def normalize_employee_count(c: Column) -> Column:
-            return when(trim(c) != '', log(c.cast(FloatType())))
+            return when(trim(c) != lit(''), log(c.cast(FloatType())))
 
         def normalize_revenue_range(c: Column) -> Column:
             return when(trim(c).isin('$1 - $1M', '$1M - $5M', '$5M - $10M', '$10M - $25M'), lit('sme'))\
@@ -516,7 +517,7 @@ class CausePreprocessing:
         # using event_type_names, which is created from the training data.
         # Since event_type_names is saved during training, it's not necessary to save the VectorAssembler
         vec_assembler = VectorAssembler(
-            inputCols=['dt'] + [re.sub(r'[^a-zA-Z0-9_]+', '_', e) for e in event_type_names_list],
+            inputCols=['dt'] + [re.sub(r'[^a-zA-Z0-9_]+', '_', event) for event in event_type_names_list],
             outputCol='event_sparse_vector'
         )
 
