@@ -29,9 +29,9 @@ def init_env(tenant_id, run_date, bucket='ceasterwood', model_id=None):
     config.bucket = bucket
     config.model_id = model_id
 
-    config.filepath = f'{config.tenant_id}/{config.run_date}/'
+    config.filepath = f'{config.tenant_id}/{config.run_date}'
     if config.model_id:
-        config.filepath += f'{config.model_id}/'
+        config.filepath += f'/{config.model_id}'
 
     event_type_names = load_event_type_names(config.bucket, config.tenant_id, config.run_date, config.model_id)
     config.model.n_event_types = event_type_names.shape[0]

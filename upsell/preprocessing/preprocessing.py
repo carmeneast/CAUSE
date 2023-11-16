@@ -170,7 +170,8 @@ class CausePreprocessing:
         # Check which accounts have activities, intent, and opp open events
         account_types = accounts.select('tenant_id', 'account_id') \
             .join(
-                opp_events.filter(col('event_type').rlike('^opened_'))
+                opp_events.filter(col('event_type').isin(
+                    'opened_new_business_opportunity', 'opened_post_customer_opportunity'))
                 .select('tenant_id', 'account_id')
                 .distinct()
                 .withColumn('open_opp', lit(1)),

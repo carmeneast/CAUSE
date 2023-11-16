@@ -1,57 +1,28 @@
+from upsell.utils.s3 import s3_key
+from typing import Optional
+
 from pyspark.sql.functions import *
 from pyspark.sql import DataFrame, SparkSession, Window
 
 spark = SparkSession.builder.getOrCreate()
 
 
-class Account:
-    tenant_id: str
-    account_id: str
-    domain: str
-    billingCountry___demandbase: str
-    billingCountry___salesforce: str
-    billingCountry___hubspot: str
-    billingCountry___dynamics: str
-    industry___demandbase: str
-    industry___salesforce: str
-    industry___hubspot: str
-    industry___dynamics: str
-    numberOfEmployees___demandbase: str
-    numberOfEmployees___salesforce: str
-    numberOfEmployees___hubspot: str
-    numberOfEmployees___dynamics: str
-    revenueRange___demandbase: str
-    start_dt: str
-
-
-class Event:
-    tenant_id: str
-    account_id: str
-    activity_date: str
-    event_type: str
-    weight: float
-
-
-class Metrics:
-    tenant_id: str
-    accounts: int
-    activities: int
-    oppEvents: int
-    intentEvents: int
-    accountsWithActivity: int
-    accountsWithOppEvent: int
-    accountsWithIntentEvent: int
-    accountsWithNoEvents: int
-    pctAccountsNoEvents: float
-
-
 class RawEvents:
-    def __init__(self, tenant_id: str, run_date: str, activity_months: int, intent_months: int, bucket: str):
+    def __init__(self, tenant_id: str, run_date: str, model_id: Optional[str],
+                 activity_months: int, intent_months: int, bucket: str,
+                 opportunity_selector: str = '',
+                 activity_selector: str = 'AND engagement > 0'):
         self.tenant_id = tenant_id
         self.run_date = run_date
+        self.model_id = model_id
         self.activity_months = activity_months
         self.intent_months = intent_months
         self.bucket = bucket
+        self.opportunity_selector = opportunity_selector
+        self.activity_selector = activity_selector
+
+        if len(self.opportunity_selector.strip()) == 0:
+            self.opportunity_selector = 'true'
 
     def get_accounts(self) -> DataFrame:
         account_query = f"""
@@ -84,7 +55,7 @@ class RawEvents:
             -- First date we started collecting data on the account
             SELECT tenant_id
                 , account_id
-                , MIN(enteredAt) AS enteredAt
+                , MIN(enteredAt) AS entered_at
             FROM db1_data_warehouse.tenant.journey
             WHERE tenant_id = '{self.tenant_id}'
             AND enteredAt <= TIMESTAMP('{self.run_date}')
@@ -94,7 +65,7 @@ class RawEvents:
             -- Last journey stage change before data collection began (if exists)
             SELECT tenant_id
                 , account_id
-                , MAX(enteredAt) AS enteredAt
+                , MAX(enteredAt) AS entered_at
             FROM db1_data_warehouse.tenant.journey
             WHERE tenant_id = '{self.tenant_id}'
             AND enteredAt <= TIMESTAMP(ADD_MONTHS('{self.run_date}', -{self.activity_months}))
@@ -103,11 +74,11 @@ class RawEvents:
         , final_dts AS (
             SELECT tenant_id
                 , account_id
-                , CASE WHEN DATE(f.enteredAt) > DATE(ADD_MONTHS('{self.run_date}', -{self.activity_months}))
-                    THEN DATE(f.enteredAt)
+                , CASE WHEN DATE(f.entered_at) > DATE(ADD_MONTHS('{self.run_date}', -{self.activity_months}))
+                    THEN DATE(f.entered_at)
                     ELSE DATE(ADD_MONTHS('{self.run_date}', -{self.activity_months}))
                     END AS start_dt
-                , COALESCE(l.enteredAt, f.enteredAt) AS initial_stage_entered_at
+                , COALESCE(l.entered_at, f.entered_at) AS initial_stage_entered_at
             FROM first_stage_dt f
             LEFT JOIN latest_stage_dt l
             USING (tenant_id, account_id)
@@ -132,10 +103,11 @@ class RawEvents:
             SELECT tenant_id
               , account_id
               , id AS opp_id
-              , DATE(createdDate) AS createdDate
-              , DATE(closeDate) AS closeDate
+              , DATE(createdDate) AS created_date
+              , DATE(closeDate) AS close_date
               , isWon
               , CASE WHEN DATE(createdDate) > DATE(closeDate) THEN 1 ELSE 0 END AS backdated
+              , CASE WHEN {self.opportunity_selector} THEN 1 ELSE 0 END AS meets_selector_criteria
               , ADD_MONTHS('{self.run_date}', -{self.activity_months}) AS start_dt
               , '{self.run_date}' AS end_dt
             FROM db1_data_warehouse.tenant.opportunity
@@ -146,9 +118,9 @@ class RawEvents:
         FROM all_opps
         WHERE (
             -- Opened during the observation period
-            (start_dt <= createdDate AND createdDate <= end_dt)
+            (start_dt <= created_date AND created_date <= end_dt)
             -- Closed during the observation period
-            OR (start_dt <= closeDate AND closeDate <= end_dt)
+            OR (start_dt <= close_date AND close_date <= end_dt)
             )
         """
         opportunities = spark.sql(opportunity_query)
@@ -157,7 +129,7 @@ class RawEvents:
         journey_query = f"""
         SELECT tenant_id
             , account_id
-            , DATE(enteredAt) AS enteredAt
+            , DATE(enteredAt) AS entered_at
             , stageName
             , CASE WHEN LOWER(stageName) RLIKE 'customer|expansion|closed won|existing|upsell'
               AND LOWER(stageName) NOT RLIKE 'lost' THEN 1 ELSE 0 END AS customer_stage
@@ -169,40 +141,40 @@ class RawEvents:
 
         opp_with_journey_stage = opportunities \
             .join(journeys, on=['tenant_id', 'account_id']) \
-            .filter(col('enteredAt') <= col('createdDate')) \
+            .filter(col('entered_at') <= col('created_date')) \
             .withColumn(
                 'rank',
                 row_number().over(
-                    Window.partitionBy('tenant_id', 'account_id', 'opp_id').orderBy(col('enteredAt').desc())
+                    Window.partitionBy('tenant_id', 'account_id', 'opp_id').orderBy(col('entered_at').desc())
                 )
             ) \
-            .filter(col('rank') == 1) \
+            .filter(col('rank') == lit(1)) \
             .drop('rank') \
-            .orderBy('tenant_id', 'account_id', 'opp_id', 'enteredAt')
+            .orderBy('tenant_id', 'account_id', 'opp_id', 'entered_at')
 
         opened = opp_with_journey_stage \
-            .filter(col('createdDate') >= col('start_dt')) \
-            .filter(col('createdDate') <= col('end_dt')) \
-            .withColumn(
-                'event_type',
-                when(col('customer_stage') == 1, lit('opened_post_customer_opportunity'))
-                .otherwise(lit('opened_new_business_opportunity'))
-            ) \
-            .select('tenant_id', 'account_id', 'createdDate', 'event_type') \
-            .withColumnRenamed('createdDate', 'activity_date')
+            .filter(col('created_date') >= col('start_dt')) \
+            .filter(col('created_date') <= col('end_dt')) \
+            .withColumn('event_type', concat(
+                lit('opened_'),
+                when(col('meets_selector_criteria') == lit(1), lit('')).otherwise(lit('unselected_')),
+                when(col('customer_stage') == lit(1), lit('post_customer')).otherwise(lit('new_business')),
+                lit('_opportunity')
+            )) \
+            .select('tenant_id', 'account_id', 'created_date', 'event_type') \
+            .withColumnRenamed('created_date', 'activity_date')
 
         closed = opp_with_journey_stage \
-            .filter(col('closeDate') >= col('start_dt')) \
-            .filter(col('closeDate') <= col('end_dt')) \
-            .withColumn(
-                'event_type',
-                when((col('customer_stage') == 1) & col('isWon'), lit('closed_won_post_customer_opportunity'))
-                .when((col('customer_stage') == 1) & ~col('isWon'), lit('closed_lost_post_customer_opportunity'))
-                .when(col('isWon'), lit('closed_won_new_business_opportunity'))
-                .when(~col('isWon'), lit('closed_lost_new_business_opportunity'))
-            ) \
-            .select('tenant_id', 'account_id', 'createdDate', 'event_type') \
-            .withColumnRenamed('createdDate', 'activity_date')
+            .filter(col('close_date') >= col('start_dt')) \
+            .filter(col('close_date') <= col('end_dt')) \
+            .withColumn('event_type', concat(
+                when(col('isWon'), lit('closed_won_')).otherwise(lit('closed_lost_')),
+                when(col('meets_selector_criteria') == lit(1), lit('')).otherwise(lit('unselected_')),
+                when(col('customer_stage') == lit(1), lit('post_customer')).otherwise(lit('new_business')),
+                lit('_opportunity')
+            )) \
+            .select('tenant_id', 'account_id', 'close_date', 'event_type') \
+            .withColumnRenamed('close_date', 'activity_date')
 
         return opened \
             .unionByName(closed) \
@@ -228,7 +200,7 @@ class RawEvents:
         AND activity_date <= TIMESTAMP('{self.run_date}')
         AND activity_date >= TIMESTAMP(ADD_MONTHS('{self.run_date}', -{self.activity_months}))
         AND activity_source_type = 'web'
-        AND engagement > 0
+        {self.activity_selector}
         GROUP BY 1, 2, 3, 4
         """
 
@@ -251,7 +223,7 @@ class RawEvents:
         AND activity_date >= TIMESTAMP(ADD_MONTHS('{self.run_date}', -{self.activity_months}))
         AND activity_source_type = 'db1-platform'
         AND activityType NOT IN ('Intent Surge')
-        AND engagement > 0
+        {self.activity_selector}
         GROUP BY 1, 2, 3, 4
         """
         return spark.sql(anonymous_activity_query)\
@@ -278,7 +250,7 @@ class RawEvents:
         AND activity_date >= TIMESTAMP(ADD_MONTHS('{self.run_date}', -{self.intent_months}))
         AND activity_source_type = 'db1-platform'
         AND activityType = 'Intent Surge'
-        AND engagement > 0
+        {self.activity_selector}
         GROUP BY 1, 2, 3, 4
         """
         keyword_intent_query = f"""
@@ -361,15 +333,17 @@ class RawEvents:
             .withColumn('pctAccountsNoEvents', col('accountsWithNoEvents') / col('accounts'))
 
     def save_parquet(self, df: DataFrame, name: str) -> None:
+        prefix = s3_key(self.tenant_id, self.run_date, self.model_id)
         df.write \
             .mode('overwrite') \
-            .parquet(f's3://{self.bucket}/upsell/{self.tenant_id}/{self.run_date}/{name}/')
+            .parquet(f's3://{self.bucket}/{prefix}{name}/')
 
     def save_json(self, df: DataFrame, name: str) -> None:
+        prefix = s3_key(self.tenant_id, self.run_date, self.model_id)
         df.coalesce(1) \
             .write \
             .mode('overwrite') \
-            .json(f's3://{self.bucket}/upsell/{self.tenant_id}/{self.run_date}/{name}/')
+            .json(f's3://{self.bucket}/{prefix}{name}/')
 
     def main(self) -> None:
         accounts = self.get_accounts().cache()
@@ -387,26 +361,32 @@ class RawEvents:
 
 
 if __name__ == '__main__':
-    TENANT_IDS = ['1309', '1619', '1681', '2874', '5715', '6114', '11640', '12636', '13279', '13574']
-    RUN_DATE = '2023-07-01'
-    ACTIVITY_MONTHS = 12
-    INTENT_MONTHS = 3
-    BUCKET = 'ceasterwood'
+    _tenant_ids = ['1309', '1619', '1681', '2874', '5715', '6114', '11640', '12636', '13279', '13574']
+    _run_date = '2023-07-01'
+    _model_id = None
+    _activity_months = 12
+    _intent_months = 3
+    _bucket = 'ceasterwood'
+    _opportunity_selector = ''
+    _activity_selector = 'AND engagement > 0'
 
     # Create datasets for each tenant and save to S3
     all_metrics = None
-    for TENANT_ID in TENANT_IDS:
-        print(f'=== {TENANT_ID} ===')
-        raw_events = RawEvents(TENANT_ID, RUN_DATE, ACTIVITY_MONTHS, INTENT_MONTHS, BUCKET)
+    for _tenant_id in _tenant_ids:
+        print(f'=== {_tenant_id} ===')
+        raw_events = RawEvents(_tenant_id, _run_date, _model_id, _activity_months, _intent_months, _bucket,
+                               _opportunity_selector, _activity_selector)
         raw_events.main()
 
         # Combine metrics datasets
-        tenant_metrics = spark.read.json(f's3://{BUCKET}/upsell/{TENANT_ID}/{RUN_DATE}/metrics/events/')
+        _prefix = s3_key(_tenant_id, _run_date, _model_id)
+        tenant_metrics = spark.read.json(f's3://{_bucket}/{_prefix}/metrics/events/')
         tenant_metrics.show()
 
         all_metrics = all_metrics.unionByName(tenant_metrics) if all_metrics else tenant_metrics
 
+    _prefix = s3_key('all-tenant-metrics', _run_date, _model_id)
     all_metrics.coalesce(1) \
         .write \
         .mode('overwrite') \
-        .json(f's3://{BUCKET}/upsell/all-tenant-metrics/{RUN_DATE}/events/')
+        .json(f's3://{_bucket}/{_prefix}/events/')
