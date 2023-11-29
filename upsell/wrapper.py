@@ -62,12 +62,9 @@ def run(device: torch.device, config: DotDict, tune_params: bool = True) -> None
     test_event_seqs = load_event_seqs(config.tenant_id, config.model_id, config.run_date, dataset='test')
     metrics = calculate_test_metrics(test_event_seqs, model, config.attribution.event_type_names, device,
                                      loader_configs=config.data_loader)
-    pd.DataFrame.from_dict(metrics, orient='index').to_json(f'{config.filepath}/test_metrics.json')
+    metrics['metrics'].to_csv(f'{config.filepath}/test_metrics.json')
+    metrics['avg_incidences'].to_csv(f'{config.filepath}/avg_incidences.json')
     plot_avg_incidence_at_k(metrics['avg_incidences'], filepath=f'{config.filepath}/avg_incidence_at_k.png')
-    plot_avg_incidence_at_k(metrics['avg_incidences_nb_opp'], event_type='Opened New Business Opportunity',
-                            filepath=f'{config.filepath}/avg_incidence_at_k_nb_opp.png')
-    plot_avg_incidence_at_k(metrics['avg_incidences_pc_opp'], event_type='Opened Post-Customer Opportunity',
-                            filepath=f'{config.filepath}/avg_incidence_at_k_pc_opp.png')
 
     # Calculate infectivity
     if not config.attribution.skip_eval_infectivity:
@@ -371,33 +368,26 @@ def train_with_tuning(device: torch.device, config: DotDict) -> ExplainableRecur
 
 def calculate_test_metrics(event_seqs: EventSeqDataset, model: ExplainableRecurrentPointProcess,
                            event_type_names: list[str], device: torch.device,
-                           loader_configs: DotDict) -> Dict[str, Union[float, Dict[float, float]]]:
+                           loader_configs: DotDict) -> Dict[str, pd.DataFrame]:
     data_loader = init_data_loader(event_seqs, loader_configs, dataset='test')
     ks = np.arange(0.0, 2.1, 0.01).tolist()
 
-    # Metrics for all events
-    metrics = model.evaluate(data_loader, device=device)
-    metrics = {k: v.avg for k, v in metrics.items()}
-    print(metrics)
-    avg_incidences = model.generate_calibration_curve(data_loader, ks, device=device)
+    metrics = dict()
+    avg_incidences = pd.DataFrame({'k': ks})
 
-    # Metrics for specific event types
-    nb_idx = np.where(np.array(event_type_names) == 'opened_new_business_opportunity')[0][0]
-    # nb_metrics = model.evaluate(data_loader, event_index=nb_idx, device=device)
-    # print(nb_metrics)
-    avg_incidences_nb_opp = model.generate_calibration_curve(data_loader, ks, event_index=nb_idx, device=device)
+    for event_type in ['all_events', 'opened_new_business_opportunity', 'opened_post_customer_opportunity']:
+        if event_type == 'all_events':
+            event_idx = None
+            # TODO: make this work for individual events
+            metrics[event_type] = model.evaluate(data_loader, event_index=event_idx, device=device)
+        else:
+            event_idx = np.where(np.array(event_type_names) == event_type)[0][0]
+        curve = model.generate_calibration_curve(data_loader, ks, event_index=event_idx, device=device)
+        avg_incidences[event_type] = [float(curve[k].avg) for k in ks]
 
-    pc_idx = np.where(np.array(event_type_names) == 'opened_post_customer_opportunity')[0][0]
-    # pc_metrics = model.evaluate(data_loader, event_index=pc_idx, device=device)
-    # print(pc_metrics)
-    avg_incidences_pc_opp = model.generate_calibration_curve(data_loader, ks, event_index=pc_idx, device=device)
     return {
-        **{k: v.avg for k, v in metrics.items()},
-        # **{f'{k}_nb_opp': v.avg for k, v in nb_metrics.items()},
-        # **{f'{k}_pc_opp': v.avg for k, v in pc_metrics.items()},
-        'avg_incidences': {k: avg_incidences[k].avg for k in ks},
-        'avg_incidences_nb_opp': {k: avg_incidences_nb_opp[k].avg for k in ks},
-        'avg_incidences_pc_opp': {k: avg_incidences_pc_opp[k].avg for k in ks},
+        'metrics': pd.DataFrame(metrics).apply(lambda col: col.apply(lambda cell: float(cell.avg))),
+        'avg_incidences': avg_incidences,
     }
 
 
@@ -426,18 +416,16 @@ def plot_training_loss(history: pd.DataFrame, tune_metric: str, filepath: Option
     plt.show()
 
 
-def plot_avg_incidence_at_k(metrics: dict[float, float], event_type: Optional[str] = None,
-                            filepath: Optional[str] = None) -> None:
-    ks = list(metrics.keys())
-    incidences = list(metrics.values())
-    plt.plot(ks, incidences)
+def plot_avg_incidence_at_k(avg_incidences: pd.DataFrame, filepath: Optional[str] = None) -> None:
+    ks = avg_incidences['k']
+    for event_type in avg_incidences.columns[1:]:
+        plt.plot(ks, avg_incidences[event_type], label=event_type)
+
     plt.plot([0, max(ks)], [0, max(ks)], linestyle=':', color='black')
-    if event_type:
-        plt.title(f'Calibration Plot ({event_type})')
-    else:
-        plt.title('Calibration Plot (All Events)')
+    plt.title('Calibration Plot')
     plt.xlabel('Predicted Incidence')
     plt.ylabel('True Average Incidence')
+    plt.legend()
     if filepath:
         plt.savefig(filepath)
     plt.show()

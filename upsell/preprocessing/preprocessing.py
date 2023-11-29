@@ -1,4 +1,6 @@
 import re
+import math
+import numpy as np
 from itertools import chain
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql.functions import *
@@ -158,11 +160,15 @@ class CausePreprocessing:
 
     def sample_accounts(self, accounts: DataFrame, activity_events: DataFrame,
                         opp_events: DataFrame, intent_events: DataFrame):
-        def has_enough_accounts(df, n_required, account_description):
-            n = df.count()
-            print(f'{account_description}: {n}')
-            if n < n_required:
-                raise ValueError(f'Tenant needs {n_required} {account_description}; only has {n}')
+        def has_enough_positives(n):
+            if n < self.CONFIG.sampling.min_positives:
+                raise ValueError(f'Tenant needs {self.CONFIG.sampling.min_positives} positives; only has {n}')
+
+        def enforce_pos_to_neg_ratio(_n_pos, _n_neg, _ratio):
+            if _n_neg < _n_pos * _ratio:
+                # If there aren't enough negatives, reduce the positives to accommodate
+                _n_pos = math.floor(_n_neg / _ratio)
+            return _n_pos
 
         # Check which accounts have activities, intent, and opp open events
         account_types = accounts.select('tenant_id', 'account_id') \
@@ -186,42 +192,57 @@ class CausePreprocessing:
                 how='left'
             )\
             .na.fill(0, ['open_opp', 'has_activity', 'has_intent'])\
-            .withColumn('rand', rand(seed=self.CONFIG.seed))
+            .withColumn('type', when(col('open_opp') == lit(1), lit('positive'))
+                        .when(col('has_activity') == lit(1), lit('neg_w_activity'))
+                        .when(col('has_intent') == lit(1), lit('neg_w_intent'))
+                        .otherwise(lit('neg_w_none')))\
+            .withColumn('rand', rand(seed=self.CONFIG.seed))\
+            .orderBy('rand')
 
         # Get positive accounts
-        pos = account_types.filter(col('open_opp') == lit(1))\
-            .orderBy('rand')\
-            .limit(self.CONFIG.sampling.max_positives)
+        pos = account_types.filter(col('type') == lit('positive'))
         n_pos = pos.count()
-        has_enough_accounts(pos, self.CONFIG.sampling.min_positives, 'positive accounts')
+        has_enough_positives(n_pos)
 
         # Get negative accounts
-        # Negatives with activity
+        neg_w_act = account_types.filter(col('type') == lit('neg_w_activity'))
+        n_neg_w_act = neg_w_act.count()
+
+        neg_w_int = account_types.filter(col('type') == lit('neg_w_intent'))
+        n_neg_w_int = neg_w_int.count()
+
+        neg_w_none = account_types.filter(col('type') == lit('neg_w_none'))
+        n_neg_w_none = neg_w_none.count()
+
+        print(f"""Available accounts:
+        Positives: {n_pos}
+        Negatives w/ activity: {n_neg_w_act}
+        Negatives w/ intent: {n_neg_w_int}
+        Negatives w/ none: {n_neg_w_none}
+        """)
+
+        # Calculate the largest sample we can create with the available accounts
+        n_pos = np.min([n_pos, self.CONFIG.sampling.max_positives])
+        n_pos = enforce_pos_to_neg_ratio(n_pos, n_neg_w_act, self.CONFIG.sampling.neg_w_activity_prop)
+        n_pos = enforce_pos_to_neg_ratio(n_pos, n_neg_w_int, self.CONFIG.sampling.neg_w_intent_prop)
+        n_pos = enforce_pos_to_neg_ratio(n_pos, n_neg_w_none, self.CONFIG.sampling.neg_w_none_prop)
+        has_enough_positives(n_pos)
+
         n_neg_w_act = n_pos * self.CONFIG.sampling.neg_w_activity_prop
-        neg_w_act = account_types.filter((col('open_opp') == lit(0)) & (col('has_activity') == lit(1)))\
-            .orderBy('rand')\
-            .limit(n_neg_w_act)
-        has_enough_accounts(neg_w_act, n_neg_w_act, 'negative accounts w/ activity')
-
-        # Negatives with intent only
         n_neg_w_int = n_pos * self.CONFIG.sampling.neg_w_intent_prop
-        neg_w_int = account_types.filter((col('open_opp') == lit(0)) & (col('has_activity') == lit(0)) &
-                                         (col('has_intent') == lit(1)))\
-            .orderBy('rand')\
-            .limit(n_neg_w_int)
-        has_enough_accounts(neg_w_int, n_neg_w_int, 'negative accounts w/ intent only')
-
-        # Negatives with no activity or intent
         n_neg_w_none = n_pos * self.CONFIG.sampling.neg_w_none_prop
-        neg_w_none = account_types.filter((col('open_opp') == lit(0)) & (col('has_activity') == lit(0)) &
-                                          (col('has_intent') == lit(0)))\
-            .orderBy('rand')\
-            .limit(n_neg_w_none)
-        has_enough_accounts(neg_w_none, n_neg_w_none, 'negative accounts w/o activity or intent')
 
-        account_sample = pos.union(neg_w_act)\
-            .union(neg_w_int)\
-            .union(neg_w_none)\
+        print(f"""Sampled accounts:
+        Positives: {n_pos}
+        Negatives w/ activity: {n_neg_w_act}
+        Negatives w/ intent: {n_neg_w_int}
+        Negatives w/ none: {n_neg_w_none}
+        """)
+
+        account_sample = pos.limit(n_pos)\
+            .union(neg_w_act.limit(n_neg_w_act))\
+            .union(neg_w_int.limit(n_neg_w_int))\
+            .union(neg_w_none.limit(n_neg_w_none))\
             .select('tenant_id', 'account_id')
 
         print(f'Total sample size: {n_pos + n_neg_w_act + n_neg_w_int + n_neg_w_none}')
