@@ -58,13 +58,6 @@ model:
     - 25
     - 52
   max_log_basis_weight: 10
-  ks:
-    - 0.001
-    - 0.01
-    - 0.1
-    - 0.5
-    - 1.0
-    - 2.0
 
 train:
   optimizer: 'Adam'

@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -8,8 +9,9 @@ from ray.air import session
 from ray.train import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
 from torch.utils.data import DataLoader
+from typing import Dict, Optional, Tuple, Union
 
-from upsell.configs import load_yaml_config
+from upsell.configs import DotDict, load_yaml_config
 from upsell.event_seq_dataset import EventSeqDataset
 from upsell.metric_tracker import MetricTracker
 from upsell.rnn import ExplainableRecurrentPointProcess
@@ -19,29 +21,27 @@ from upsell.utils.s3 import load_event_type_names, load_numpy_data, load_pytorch
     save_pytorch_dataset, save_pytorch_model, save_attributions
 
 
-def init_env(tenant_id, run_date, bucket='ceasterwood', model_id=None):
+def init_env(tenant_id: int, model_id: str, run_date: str, bucket: str = 'ceasterwood') -> Tuple[torch.device, DotDict]:
     config = load_yaml_config('upsell/config.yml')
     set_rand_seed(config.env.seed, config.env.cuda)
     device = get_device(cuda=config.env.cuda)
 
     config.tenant_id = tenant_id
+    config.model_id = model_id
     config.run_date = run_date
     config.bucket = bucket
-    config.model_id = model_id
 
-    config.filepath = f'{config.tenant_id}/{config.run_date}'
-    if config.model_id:
-        config.filepath += f'/{config.model_id}'
+    config.filepath = f'{config.tenant_id}/{config.model_id}/{config.run_date}'
 
-    event_type_names = load_event_type_names(config.bucket, config.tenant_id, config.run_date, config.model_id)
+    event_type_names = load_event_type_names(config.bucket, config.tenant_id, config.model_id, config.run_date)
     config.model.n_event_types = event_type_names.shape[0]
     config.attribution.event_type_names = event_type_names['event_type'].to_list()
     return device, config
 
 
-def run(device, config, tune_params=True):
+def run(device: torch.device, config: DotDict, tune_params: bool = True) -> None:
     # Get event sequences
-    train_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.model_id, dataset='train')
+    train_event_seqs = load_event_seqs(config.tenant_id, config.model_id, config.run_date, dataset='train')
 
     # Train model
     if tune_params:
@@ -50,7 +50,7 @@ def run(device, config, tune_params=True):
         train_data_loader, valid_data_loader = init_data_loader(train_event_seqs, config.data_loader, dataset='train')
         untrained_model = init_model(config.model, device=device)
         model = train(train_data_loader, valid_data_loader, untrained_model, config.train,
-                      config.tenant_id, config.run_date, config.model_id, config.filepath,
+                      config.tenant_id, config.model_id, config.run_date, config.filepath,
                       device=device, tune_params=False)
         save_pytorch_model(model, config.bucket, config.tenant_id, config.run_date, config.model_id)
 
@@ -59,11 +59,15 @@ def run(device, config, tune_params=True):
     plot_training_loss(history, tune_metric=config.train.tune_metric, filepath=f'{config.filepath}/training_loss.png')
 
     # Evaluate model on test set
-    test_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.model_id, dataset='test')
-    metrics = calculate_test_metrics(test_event_seqs, model, device, loader_configs=config.data_loader)
-    pd.DataFrame.from_dict({k: v.avg for k, v in metrics.items()}, orient='index')\
-        .to_json(f'{config.filepath}/test_metrics.json')
-    plot_avg_incidence_at_k(metrics, ks=model.ks, filepath=f'{config.filepath}/avg_incidence_at_k.png')
+    test_event_seqs = load_event_seqs(config.tenant_id, config.model_id, config.run_date, dataset='test')
+    metrics = calculate_test_metrics(test_event_seqs, model, config.attribution.event_type_names, device,
+                                     loader_configs=config.data_loader)
+    pd.DataFrame.from_dict(metrics, orient='index').to_json(f'{config.filepath}/test_metrics.json')
+    plot_avg_incidence_at_k(metrics['avg_incidences'], filepath=f'{config.filepath}/avg_incidence_at_k.png')
+    plot_avg_incidence_at_k(metrics['avg_incidences_nb_opp'], event_type='Opened New Business Opportunity',
+                            filepath=f'{config.filepath}/avg_incidence_at_k_nb_opp.png')
+    plot_avg_incidence_at_k(metrics['avg_incidences_pc_opp'], event_type='Opened Post-Customer Opportunity',
+                            filepath=f'{config.filepath}/avg_incidence_at_k_pc_opp.png')
 
     # Calculate infectivity
     if not config.attribution.skip_eval_infectivity:
@@ -78,7 +82,7 @@ def run(device, config, tune_params=True):
         print(attribution_matrix.shape)
 
     # Predict future event intensities on test set
-    pred_event_seqs = load_event_seqs(config.tenant_id, config.run_date, config.model_id, dataset='pred')
+    pred_event_seqs = load_event_seqs(config.tenant_id, config.model_id, config.run_date, dataset='pred')
     intensities, cumulants = predict(
         pred_event_seqs,
         model,
@@ -92,7 +96,7 @@ def run(device, config, tune_params=True):
                              config.run_date, config.model_id, name)
 
 
-def get_device(cuda: bool, dynamic: bool = False):
+def get_device(cuda: bool, dynamic: bool = False) -> torch.device:
     if torch.cuda.is_available() and cuda:
         if dynamic:
             device = torch.device('cuda', get_freer_gpu(by='n_proc'))
@@ -103,7 +107,7 @@ def get_device(cuda: bool, dynamic: bool = False):
     return device
 
 
-def load_event_seqs(tenant_id, run_date, model_id=None, dataset='train'):
+def load_event_seqs(tenant_id: int, model_id: str, run_date: str, dataset: str = 'train') -> EventSeqDataset:
     bucket = 'ceasterwood'
     data = load_numpy_data(bucket, tenant_id, run_date, model_id, dataset)
     event_seqs = data['event_seqs']
@@ -115,7 +119,8 @@ def load_event_seqs(tenant_id, run_date, model_id=None, dataset='train'):
     return event_seqs
 
 
-def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribution: bool = False):
+def init_data_loader(event_seqs: EventSeqDataset, loader_configs: DotDict, dataset: str = 'train',
+                     attribution: bool = False) -> Union[DataLoader, Tuple[DataLoader, DataLoader]]:
     if attribution:
         batch_size = loader_configs.attr_batch_size
     elif isinstance(loader_configs['batch_size'], int):
@@ -155,7 +160,7 @@ def init_data_loader(event_seqs, loader_configs, dataset: str = 'train', attribu
         return data_loader
 
 
-def init_model(model_configs, device=None):
+def init_model(model_configs: DotDict, device: Optional[torch.device] = None) -> ExplainableRecurrentPointProcess:
     model = ExplainableRecurrentPointProcess(
         n_event_types=model_configs['n_event_types'],
         embedding_dim=model_configs['embedding_dim'] if isinstance(model_configs['embedding_dim'], int)
@@ -168,15 +173,16 @@ def init_model(model_configs, device=None):
         basis_type=model_configs['basis_type'],
         basis_means=model_configs['basis_means'],
         max_log_basis_weight=model_configs['max_log_basis_weight'],
-        ks=model_configs['ks'],
     )
     if device is not None:
         model = model.to(device)
     return model
 
 
-def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id, run_date, model_id, filepath,
-          device=None, tune_params=True):
+def train(train_data_loader: DataLoader, valid_data_loader: DataLoader,
+          model: ExplainableRecurrentPointProcess, train_configs: DotDict,
+          tenant_id: int, model_id: str, run_date: str, filepath: str,
+          device: Optional[torch.device] = None, tune_params: bool = True) -> ExplainableRecurrentPointProcess:
     bucket = 'ceasterwood'
     patience = train_configs['patience'] if tune_params else train_configs.patience.no_tuning
 
@@ -208,8 +214,9 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
 
     model.train()
 
+    metrics = ['nll']
     epoch_metrics = {
-        loss_type: {metric: MetricTracker(metric=metric) for metric in model.metrics}
+        loss_type: {metric: MetricTracker(metric=metric) for metric in metrics}
         for loss_type in ['train', 'valid']
     }
     for epoch in range(start_epoch, train_configs['epochs']):
@@ -224,7 +231,7 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
         )
         # Store training and validation metrics for this epoch
         for loss_type in ['train', 'valid']:
-            for metric in model.metrics:
+            for metric in metrics:
                 n = eval(f'{loss_type}_metrics')[metric].count
                 val = eval(f'{loss_type}_metrics')[metric].avg
                 if isinstance(val, torch.Tensor):
@@ -239,7 +246,7 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
                 'epoch': [epoch],
                 'dt': [(end - start).total_seconds()],
                 **{f'{loss_type}_{metric}': [epoch_metrics[loss_type][metric].avg]
-                   for loss_type in ['train', 'valid'] for metric in model.metrics}
+                   for loss_type in ['train', 'valid'] for metric in metrics}
             })
         ]).reset_index(drop=True)
 
@@ -287,14 +294,14 @@ def train(train_data_loader, valid_data_loader, model, train_configs, tenant_id,
     return model
 
 
-def train_with_tuning(device, config):
+def train_with_tuning(device: torch.device, config: DotDict) -> ExplainableRecurrentPointProcess:
     def __train_with_tuning(__search_space, tenant_id, run_date, model_id, filepath):
-        train_event_seqs = load_event_seqs(tenant_id, run_date, model_id, dataset='train')
+        train_event_seqs = load_event_seqs(tenant_id, model_id, run_date, dataset='train')
         train_data_loader, valid_data_loader = init_data_loader(
             train_event_seqs, __search_space['data_loader'], dataset='train')
         untrained_model = init_model(__search_space['model'])
         _ = train(train_data_loader, valid_data_loader, untrained_model, __search_space['train'],
-                  tenant_id, run_date, model_id, filepath, tune_params=True)
+                  tenant_id, model_id, run_date, filepath, tune_params=True)
 
     # Create search space for hyperparameters
     search_space = {
@@ -316,7 +323,6 @@ def train_with_tuning(device, config):
             'basis_type': config.model.basis_type,
             'basis_means': config.model.basis_means,
             'max_log_basis_weight': config.model.max_log_basis_weight,
-            'ks': config.model.ks,
         },
         'train': {
             'optimizer': config.train.optimizer,
@@ -363,15 +369,40 @@ def train_with_tuning(device, config):
     return best_model
 
 
-def calculate_test_metrics(event_seqs, model, device, loader_configs):
+def calculate_test_metrics(event_seqs: EventSeqDataset, model: ExplainableRecurrentPointProcess,
+                           event_type_names: list[str], device: torch.device,
+                           loader_configs: DotDict) -> Dict[str, Union[float, Dict[float, float]]]:
     data_loader = init_data_loader(event_seqs, loader_configs, dataset='test')
+    ks = np.arange(0.0, 2.1, 0.01).tolist()
+
+    # Metrics for all events
     metrics = model.evaluate(data_loader, device=device)
-    msg = '[Test] ' + ', '.join(f'{k}={v.avg:.4f}' for k, v in metrics.items())
-    print(msg)
-    return metrics
+    metrics = {k: v.avg for k, v in metrics.items()}
+    print(metrics)
+    avg_incidences = model.generate_calibration_curve(data_loader, ks, device=device)
+
+    # Metrics for specific event types
+    nb_idx = np.where(np.array(event_type_names) == 'opened_new_business_opportunity')[0][0]
+    # nb_metrics = model.evaluate(data_loader, event_index=nb_idx, device=device)
+    # print(nb_metrics)
+    avg_incidences_nb_opp = model.generate_calibration_curve(data_loader, ks, event_index=nb_idx, device=device)
+
+    pc_idx = np.where(np.array(event_type_names) == 'opened_post_customer_opportunity')[0][0]
+    # pc_metrics = model.evaluate(data_loader, event_index=pc_idx, device=device)
+    # print(pc_metrics)
+    avg_incidences_pc_opp = model.generate_calibration_curve(data_loader, ks, event_index=pc_idx, device=device)
+    return {
+        **{k: v.avg for k, v in metrics.items()},
+        # **{f'{k}_nb_opp': v.avg for k, v in nb_metrics.items()},
+        # **{f'{k}_pc_opp': v.avg for k, v in pc_metrics.items()},
+        'avg_incidences': {k: avg_incidences[k].avg for k in ks},
+        'avg_incidences_nb_opp': {k: avg_incidences_nb_opp[k].avg for k in ks},
+        'avg_incidences_pc_opp': {k: avg_incidences_pc_opp[k].avg for k in ks},
+    }
 
 
-def calculate_infectivity(event_seqs, model, device, loader_configs, attribution_configs):
+def calculate_infectivity(event_seqs: EventSeqDataset, model: ExplainableRecurrentPointProcess, device: torch.device,
+                          loader_configs: DotDict, attribution_configs: DotDict) -> pd.DataFrame:
     attr_data_loader = init_data_loader(event_seqs, loader_configs, attribution=True)
     attr_matrix = model.get_infectivity(
         attr_data_loader,
@@ -384,7 +415,7 @@ def calculate_infectivity(event_seqs, model, device, loader_configs, attribution
     return attr_df
 
 
-def plot_training_loss(history, tune_metric, filepath=None):
+def plot_training_loss(history: pd.DataFrame, tune_metric: str, filepath: Optional[str] = None) -> None:
     plt.plot(history[f'train_{tune_metric}'], label='train')
     plt.plot(history[f'valid_{tune_metric}'], label='valid')
     plt.xlabel('epoch')
@@ -395,11 +426,16 @@ def plot_training_loss(history, tune_metric, filepath=None):
     plt.show()
 
 
-def plot_avg_incidence_at_k(metrics, ks, filepath=None):
-    incidences = [metrics[f'avg_incidence_at_{k}'].avg for k in ks]
+def plot_avg_incidence_at_k(metrics: dict[float, float], event_type: Optional[str] = None,
+                            filepath: Optional[str] = None) -> None:
+    ks = list(metrics.keys())
+    incidences = list(metrics.values())
     plt.plot(ks, incidences)
     plt.plot([0, max(ks)], [0, max(ks)], linestyle=':', color='black')
-    plt.title('Calibration Plot')
+    if event_type:
+        plt.title(f'Calibration Plot ({event_type})')
+    else:
+        plt.title('Calibration Plot (All Events)')
     plt.xlabel('Predicted Incidence')
     plt.ylabel('True Average Incidence')
     if filepath:
@@ -407,7 +443,8 @@ def plot_avg_incidence_at_k(metrics, ks, filepath=None):
     plt.show()
 
 
-def predict(event_seqs, model, device, loader_configs, time_steps=range(1, 5)):
+def predict(event_seqs: EventSeqDataset, model: ExplainableRecurrentPointProcess, device: torch.device,
+            loader_configs: DotDict, time_steps: list[int] = range(1, 5)):
     data_loader = init_data_loader(event_seqs, loader_configs, dataset='pred')
     intensities, cumulants = \
         model.predict_future_event_intensities(data_loader, device, time_steps)
@@ -416,9 +453,10 @@ def predict(event_seqs, model, device, loader_configs, time_steps=range(1, 5)):
 
 if __name__ == '__main__':
     TENANT_ID = 1309
-    RUN_DATE = '2023-07-01'
+    RUN_DATE = '2023-11-01'
     BUCKET = 'ceasterwood'
-    MODEL_ID = None
+    MODEL_ID = '2'
+    TUNE_PARAMS = True
 
-    DEVICE, CONFIG = init_env(TENANT_ID, RUN_DATE, BUCKET, MODEL_ID)
-    run(DEVICE, CONFIG, tune_params=True)
+    DEVICE, CONFIG = init_env(TENANT_ID, MODEL_ID, RUN_DATE, BUCKET)
+    run(DEVICE, CONFIG, TUNE_PARAMS)

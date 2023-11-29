@@ -9,7 +9,7 @@ spark = SparkSession.builder.getOrCreate()
 
 class TruePrecisionOpps:
 
-    def __init__(self, tenant_id: str, model_id: Optional[str], run_date: str, opportunity_selector: str = '',
+    def __init__(self, tenant_id: str, model_id: str, run_date: str, opportunity_selector: str = '',
                  days_of_opps: int = 30, bucket: str = 'ceasterwood'):
         self.tenant_id = tenant_id
         self.model_id = model_id
@@ -91,9 +91,9 @@ class TruePrecisionOpps:
 
 
 if __name__ == '__main__':
-    _tenant_ids = ['1681']  # ['1309', '1619', '1681', '2874', '5715', '6114', '11640', '12636', '13279', '13574']
-    _model_id = 'ads'
-    _run_date = '2023-07-01'
+    _tenant_ids = ['1681']
+    _model_id = '2'
+    _run_date = '2023-11-01'
     _days_of_opps = 35
     _opportunity_selector = ''
     _bucket = 'ceasterwood'

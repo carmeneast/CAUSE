@@ -13,6 +13,7 @@ from upsell.preprocessing.country_map import COUNTRY_MAP
 from upsell.preprocessing.flat_event_type_rollup import FlatEventTypeRollUp, FlatEventTypeRollUpModel
 from upsell.preprocessing.hierarchical_event_type_rollup import HierarchicalEventTypeRollUp, \
     HierarchicalEventTypeRollUpModel
+from upsell.utils.s3 import s3_key
 
 
 class CausePreprocessing:
@@ -21,7 +22,7 @@ class CausePreprocessing:
                  spark: SparkSession,
                  tenant_id: int,
                  run_date: str,
-                 model_id: Optional[str] = None,
+                 model_id: str,
                  bucket: str = 'ceasterwood',
                  weekly: bool = True
                  ):
@@ -34,10 +35,8 @@ class CausePreprocessing:
 
         self.CONFIG = load_yaml_config('upsell/config.yml').preprocessing
 
-        self.model_path = f'upsell/{self.tenant_id}/{self.run_date}/'
-        if self.model_id:
-            self.model_path += f'{self.model_id}/'
-        self.transformed_data_path = f's3://{self.bucket}/{self.model_path}'
+        prefix = s3_key(self.tenant_id, self.run_date, self.model_id)
+        self.data_path = f's3://{self.bucket}/{prefix}'
 
         self.firmo_rollup: Optional[PipelineModel] = None
         self.firmo_event_types: Optional[Dict[str, List[str]]] = None
@@ -48,12 +47,10 @@ class CausePreprocessing:
     def run(self, dataset: str = 'train'):
         # Load raw event data
         print('Loading raw event data...')
-        raw_data_path = f's3://{self.bucket}/upsell/{self.tenant_id}/{self.run_date}'
-
-        accounts = self.spark.read.parquet(f'{raw_data_path}/accounts')
-        activities = self.spark.read.parquet(f'{raw_data_path}/activities')
-        opps = self.spark.read.parquet(f'{raw_data_path}/oppEvents')
-        intent = self.spark.read.parquet(f'{raw_data_path}/intentEvents')
+        accounts = self.spark.read.parquet(f'{self.data_path}/accounts')
+        activities = self.spark.read.parquet(f'{self.data_path}/activities')
+        opps = self.spark.read.parquet(f'{self.data_path}/oppEvents')
+        intent = self.spark.read.parquet(f'{self.data_path}/intentEvents')
 
         # Create timeline events
         print('Creating timeline events...')
@@ -64,22 +61,22 @@ class CausePreprocessing:
         if dataset == 'train':
             print('Sampling accounts...')
             account_sample = self.sample_accounts(accounts, activity_events, opp_events, intent_events)
-            self.save_parquet(account_sample, f'{self.transformed_data_path}/account_sample')
+            self.save_parquet(account_sample, f'{self.data_path}/account_sample')
 
             print('Splitting into train/test...')
             train_accounts, test_accounts = self.train_test_split(account_sample)
-            self.save_parquet(train_accounts, f'{self.transformed_data_path}/train_accounts')
-            self.save_parquet(test_accounts, f'{self.transformed_data_path}/test_accounts')
+            self.save_parquet(train_accounts, f'{self.data_path}/train_accounts')
+            self.save_parquet(test_accounts, f'{self.data_path}/test_accounts')
 
             accounts = train_accounts
 
         elif dataset == 'test':
-            accounts = self.spark.read.parquet(f'{self.transformed_data_path}/test_accounts')
+            accounts = self.spark.read.parquet(f'{self.data_path}/test_accounts')
 
         print(f'Preprocessing {dataset} data...')
         sparse_matrices = self.apply_preprocessing(accounts, activity_events, opp_events, intent_events,
                                                    dataset=dataset)
-        self.save_parquet(sparse_matrices, f'{self.transformed_data_path}/{dataset}_sparse_matrices')
+        self.save_parquet(sparse_matrices, f'{self.data_path}/{dataset}_sparse_matrices')
 
     def apply_preprocessing(self, accounts: DataFrame, activity_events: DataFrame,
                             opp_events: DataFrame, intent_events: DataFrame, dataset: str = 'train'):
@@ -91,8 +88,8 @@ class CausePreprocessing:
             # Fit firmographic roll-up
             print('Fitting firmographic roll-up...')
             self.firmo_rollup, self.firmo_event_types = self.fit_firmographic_roll_up(accounts_cleaned)
-            self.firmo_rollup.write().overwrite().save(f'{self.transformed_data_path}/firmo_rollup_pipeline')
-            self.save_json(self.firmo_event_types, f'{self.transformed_data_path}/firmo_event_types')
+            self.firmo_rollup.write().overwrite().save(f'{self.data_path}/firmo_rollup_pipeline')
+            self.save_json(self.firmo_event_types, f'{self.data_path}/firmo_event_types')
 
             # Fit activity + intent roll-up
             print('Fitting activity + intent event roll-up...')
@@ -102,13 +99,13 @@ class CausePreprocessing:
                 intent_events.join(accounts_cleaned.select('tenant_id', 'account_id'),
                                    on=['tenant_id', 'account_id'], how='inner')
             )
-            self.save_json(self.event_type_rollup, f'{self.transformed_data_path}/event_type_rollup_pipeline')
+            self.save_json(self.event_type_rollup, f'{self.data_path}/event_type_rollup_pipeline')
         else:
             # Load roll-ups
             print('Loading preprocessors...')
-            self.firmo_rollup = PipelineModel.load(f'{self.transformed_data_path}/firmo_rollup_pipeline')
-            self.firmo_event_types = self.spark.read.json(f'{self.transformed_data_path}/firmo_event_types')
-            self.event_type_rollup = self.spark.read.json(f'{self.transformed_data_path}/event_type_rollup_pipeline')
+            self.firmo_rollup = PipelineModel.load(f'{self.data_path}/firmo_rollup_pipeline')
+            self.firmo_event_types = self.spark.read.json(f'{self.data_path}/firmo_event_types')
+            self.event_type_rollup = self.spark.read.json(f'{self.data_path}/event_type_rollup_pipeline')
 
         # Roll up firmographics and activities
         print('Rolling up firmographics...')
@@ -132,15 +129,15 @@ class CausePreprocessing:
         # Combine events
         print('Combining events...')
         all_events = self.combine_events(accounts_transformed, firmo_events, opp_events, rolled_up_events)
-        self.save_parquet(all_events, f'{self.transformed_data_path}/{dataset}_all_events')
+        self.save_parquet(all_events, f'{self.data_path}/{dataset}_all_events')
 
         if dataset == 'train':
             # Get event type names
             print('Getting event type names...')
             self.event_type_names = all_events.select('event_type').distinct().orderBy('event_type').coalesce(1).cache()
-            self.save_parquet(self.event_type_names, f'{self.transformed_data_path}/event_type_names')
+            self.save_parquet(self.event_type_names, f'{self.data_path}/event_type_names')
         else:
-            self.event_type_names = self.spark.read.parquet(f'{self.transformed_data_path}/event_type_names').cache()
+            self.event_type_names = self.spark.read.parquet(f'{self.data_path}/event_type_names').cache()
 
         self.n_event_types = self.event_type_names.count()
         print(f'Event types: {self.n_event_types}')
@@ -435,6 +432,14 @@ class CausePreprocessing:
         for feat in event_type_dict.keys():
             print(f'Applying event type roll-up to {feat}...')
             print(len(event_type_dict[feat]), event_type_dict[feat][:5])
+
+            if feat == 'activities':
+                # Get counts of anonymous and non-anonymous activities
+                anon_activities = [activity for activity in event_type_dict[feat]
+                                   if activity.startswith('page_visits_anonymous__other__')]
+                print(len(anon_activities), 'Anonymous Activities:', anon_activities[:5])
+                print(len(event_type_dict[feat]) - len(anon_activities), 'Identified Activities')
+
             model = HierarchicalEventTypeRollUpModel(self.CONFIG.seed, event_type_dict[feat])
 
             if feat == 'activities':

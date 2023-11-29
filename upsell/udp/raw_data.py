@@ -101,15 +101,15 @@ class RawEvents:
         opportunity_query = f"""
         WITH all_opps AS (
             SELECT tenant_id
-              , account_id
-              , id AS opp_id
-              , DATE(createdDate) AS created_date
-              , DATE(closeDate) AS close_date
-              , isWon
-              , CASE WHEN DATE(createdDate) > DATE(closeDate) THEN 1 ELSE 0 END AS backdated
-              , CASE WHEN {self.opportunity_selector} THEN 1 ELSE 0 END AS meets_selector_criteria
-              , ADD_MONTHS('{self.run_date}', -{self.activity_months}) AS start_dt
-              , '{self.run_date}' AS end_dt
+                , account_id
+                , id AS opp_id
+                , DATE(createdDate) AS created_date
+                , DATE(closeDate) AS close_date
+                , isWon
+                , CASE WHEN DATE(createdDate) > DATE(closeDate) THEN 1 ELSE 0 END AS backdated
+                , CASE WHEN {self.opportunity_selector} THEN 1 ELSE 0 END AS meets_selector_criteria
+                , ADD_MONTHS('{self.run_date}', -{self.activity_months}) AS start_dt
+                , '{self.run_date}' AS end_dt
             FROM db1_data_warehouse.tenant.opportunity
             WHERE tenant_id = '{self.tenant_id}'
             ORDER BY 1, 2, 3, 4
@@ -287,8 +287,7 @@ class RawEvents:
 
         return intent_surge_df
 
-    @staticmethod
-    def calculate_metrics(accounts: DataFrame, activities: DataFrame, opp_events: DataFrame,
+    def calculate_metrics(self, accounts: DataFrame, activities: DataFrame, opp_events: DataFrame,
                           intent_events: DataFrame) -> DataFrame:
         # Drop events for accounts not in CRM
         activities = activities.join(accounts, on=['tenant_id', 'account_id'], how='inner')
@@ -296,16 +295,16 @@ class RawEvents:
         intent_events = intent_events.join(accounts, on=['tenant_id', 'account_id'], how='inner')
 
         # Get event counts
-        tenant_id = accounts.select('tenant_id').distinct()
+        tenant_id = accounts.select('tenant_id').distinct().withColumn('model_id', lit(self.model_id))
         n_activities = activities.agg(sum('weight').alias('activities')).na.fill(0)
-        n_opp_events = opp_events.agg(sum('weight').alias('oppEvents')).na.fill(0)
-        n_intent_events = intent_events.agg(sum('weight').alias('intentEvents')).na.fill(0)
+        n_opp_events = opp_events.agg(sum('weight').alias('opp_events')).na.fill(0)
+        n_intent_events = intent_events.agg(sum('weight').alias('intent_events')).na.fill(0)
 
         # Get account counts
         n = accounts.agg(count('*').alias('accounts'))
-        n_acct_w_activity = activities.agg(countDistinct('account_id').alias('accountsWithActivity'))
-        n_acct_w_opp = opp_events.agg(countDistinct('account_id').alias('accountsWithOppEvent'))
-        n_acct_w_intent = intent_events.agg(countDistinct('account_id').alias('accountsWithIntentEvent'))
+        n_acct_w_activity = activities.agg(countDistinct('account_id').alias('accounts_w_activity'))
+        n_acct_w_opp = opp_events.agg(countDistinct('account_id').alias('accounts_w_opp_event'))
+        n_acct_w_intent = intent_events.agg(countDistinct('account_id').alias('accounts_w_intent_event'))
 
         n_acct_no_events = accounts \
             .join(activities, on=['tenant_id', 'account_id'], how='left') \
@@ -316,7 +315,7 @@ class RawEvents:
             .select('tenant_id', 'account_id') \
             .join(intent_events, on=['tenant_id', 'account_id'], how='left') \
             .filter(col('weight').isNull()) \
-            .agg(count('*').alias('accountsWithNoEvents'))
+            .agg(count('*').alias('accounts_w_no_events'))
 
         # Join all metrics
         return tenant_id.join(n) \
@@ -327,10 +326,10 @@ class RawEvents:
             .join(n_acct_w_opp) \
             .join(n_acct_w_intent) \
             .join(n_acct_no_events) \
-            .withColumn('pctAccountsWActivity', col('accountsWithActivity') / col('accounts')) \
-            .withColumn('pctAccountsWOppEvent', col('accountsWithOppEvent') / col('accounts')) \
-            .withColumn('pctAccountsWIntentEvent', col('accountsWithIntentEvent') / col('accounts')) \
-            .withColumn('pctAccountsNoEvents', col('accountsWithNoEvents') / col('accounts'))
+            .withColumn('pct_accounts_w_activity', col('accounts_w_activity') / col('accounts')) \
+            .withColumn('pct_accounts_w_opp_event', col('accounts_w_opp_event') / col('accounts')) \
+            .withColumn('pct_accounts_w_intent_event', col('accounts_w_intent_event') / col('accounts')) \
+            .withColumn('pct_accounts_w_no_events', col('accounts_w_no_events') / col('accounts'))
 
     def save_parquet(self, df: DataFrame, name: str) -> None:
         prefix = s3_key(self.tenant_id, self.run_date, self.model_id)
@@ -353,17 +352,17 @@ class RawEvents:
 
         metrics = self.calculate_metrics(accounts, activities, opp_events, intent_events).cache()
 
-        self.save_parquet(accounts, "accounts")
-        self.save_parquet(opp_events, "oppEvents")
-        self.save_parquet(activities, "activities")
-        self.save_parquet(intent_events, "intentEvents")
-        self.save_json(metrics, "metrics/events/")
+        self.save_parquet(accounts, 'accounts')
+        self.save_parquet(opp_events, 'oppEvents')
+        self.save_parquet(activities, 'activities')
+        self.save_parquet(intent_events, 'intentEvents')
+        self.save_json(metrics, 'metrics/events/')
 
 
 if __name__ == '__main__':
-    _tenant_ids = ['1309', '1619', '1681', '2874', '5715', '6114', '11640', '12636', '13279', '13574']
-    _run_date = '2023-07-01'
-    _model_id = None
+    _tenant_ids = ['227', '358', '366', '1309', '1681']
+    _run_date = '2023-11-01'
+    _model_id = '2'
     _activity_months = 12
     _intent_months = 3
     _bucket = 'ceasterwood'

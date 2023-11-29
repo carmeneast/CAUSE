@@ -50,8 +50,6 @@ class ExplainableRecurrentPointProcess(nn.Module):
             n_bases: Optional[int] = None,
             max_mean: Optional[float] = None,
             basis_means: Optional[List[Union[int, float]]] = None,
-            # Metrics
-            ks: list = None,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -72,10 +70,6 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.max_log_basis_weight = max_log_basis_weight
         self.embedder, self.encoder, self.dropout, self.decoder = None, None, None, None
         self.define_model(embedding_dim, hidden_size, rnn, dropout)
-
-        # Metrics
-        self.ks = ks if ks is not None else [0.1, 1.0]
-        self.metrics = ['nll'] + [f'avg_incidence_at_{k}' for k in self.ks]
 
     def define_model(self, embedding_dim: int, hidden_size: int, rnn: str, dropout: float) -> None:
         # TODO: Move this into nn.Sequential
@@ -172,7 +166,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         )
 
         # Cap basis weights to avoid numerical instability
-        # TODO: Can the clamper be defined in self.define_model()?
+        # TODO: Can the clamping be defined in self.define_model()?
         #  - So that it's not redefined on every forward pass
         #  - So we don't have to make model configs like self.max_log_basis_weight a class attribute
         #  - Requires using a clamping function from torch.nn.functional or subclassing nn.Module
@@ -250,12 +244,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
     @staticmethod
     def _eval_avg_incidence_at_k(batch: FloatTensor, log_intensities: FloatTensor, k: float = 1.0, eps: float = 0.1)\
             -> Tuple[float, int]:
-        # Select events with 0.95k <= intensity < 1.05k
-        mask = (log_intensities >= np.log(k * (1 - eps/2))) &\
-               (log_intensities < np.log(k * (1 + eps/2)))
+        # Select events with (k - eps) <= intensity <= (k + eps)
+        mask = (log_intensities >= np.log(k - eps)) & (log_intensities < np.log(k + eps))
         events_w_intensity_k = batch[:, :, 1:].masked_select(mask)
 
-        # Check average incidence of events with 0.95k <= intensity < 1.05k
+        # Check average incidence of events with (k - eps) <= intensity <= (k + eps)
         avg_incidence = events_w_intensity_k.mean()
         n = len(events_w_intensity_k)
         return avg_incidence, n
@@ -268,7 +261,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
             device: Optional = None,
             **kwargs,
     ) -> Tuple[Dict[str, MetricTracker], Dict[str, MetricTracker]]:
-        train_metrics = {m: MetricTracker(metric=m) for m in ['loss', 'l2_reg'] + self.metrics}
+        train_metrics = {m: MetricTracker(metric=m) for m in ['nll', 'loss', 'l2_reg']}
 
         self.train()
         for batch in train_data_loader:
@@ -303,10 +296,6 @@ class ExplainableRecurrentPointProcess(nn.Module):
             train_metrics['loss'].update(loss, batch.size(0))
             train_metrics['nll'].update(nll, batch.size(0))
             train_metrics['l2_reg'].update(l2_reg, seq_length.sum())
-            for k in self.ks:
-                p, n = self._eval_avg_incidence_at_k(batch, log_intensities, k)
-                if n > 0:
-                    train_metrics[f'avg_incidence_at_{k}'].update(p, n)
 
         if valid_data_loader:
             valid_metrics = self.evaluate(valid_data_loader, device=device)
@@ -315,8 +304,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
 
         return train_metrics, valid_metrics
 
-    def evaluate(self, data_loader: DataLoader, device: Optional = None) -> Dict[str, MetricTracker]:
-        metrics = {m: MetricTracker(metric=m) for m in self.metrics}
+    def evaluate(self, data_loader: DataLoader, event_index: Optional[int] = None,
+                 device: Optional[torch.device] = None) -> Dict[str, MetricTracker]:
+        metrics = {m: MetricTracker(metric=m) for m in ['nll']}
 
         self.eval()
         with torch.no_grad():
@@ -328,19 +318,37 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 mask = generate_sequence_mask(seq_length)
 
                 log_intensities, log_basis_weights = self.forward(
-                    batch, return_weights=True
+                    batch, return_weights=True, target_type=event_index
                 )
+                # TODO: calculate NLL for a specific event type
                 nll = self._eval_nll(
                     batch, log_intensities, log_basis_weights, mask
                 )
 
                 metrics['nll'].update(nll, batch.size(0))
-                for k in self.ks:
-                    p, n = self._eval_avg_incidence_at_k(batch, log_intensities, k)
-                    if n > 0:
-                        metrics[f'avg_incidence_at_{k}'].update(p, n)
 
         return metrics
+
+    def generate_calibration_curve(self, data_loader: DataLoader, ks: list[float], event_index: Optional[int] = None,
+                                   eps: float = 0.1, device: Optional[torch.device] = None) -> Dict[str, MetricTracker]:
+        avg_incidences = {k: MetricTracker(metric=k) for k in ks}
+
+        self.eval()
+        with torch.no_grad():
+            for batch in data_loader:
+                if device:
+                    batch = batch.to(device)
+
+                log_intensities, log_basis_weights = self.forward(
+                    batch, return_weights=True, target_type=event_index
+                )
+
+                for k in ks:
+                    p, n = self._eval_avg_incidence_at_k(batch, log_intensities, k, eps)
+                    if n > 0:
+                        avg_incidences[k].update(p, n)
+
+        return avg_incidences
 
     def predict_future_event_intensities(
             self,
@@ -474,7 +482,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 # Shape: [batch_size, time_stamps, n_event_types+1]
                 integrated_grads = (batch - baselines) * avg_grads
 
-                # For each account and timestamp (excl final timestep), sum gradients from each event type
+                # For each account and timestamp (excl final time step), sum gradients from each event type
                 event_scores[k] = integrated_grads[:, :-1].sum(-1)
 
             # Update attribution matrix with the gradient of each event type w.r.t. each event type
