@@ -23,6 +23,7 @@ class CausePreprocessing:
     def __init__(self,
                  spark: SparkSession,
                  tenant_id: int,
+                 train_date: str,
                  run_date: str,
                  model_id: str,
                  bucket: str = 'ceasterwood',
@@ -30,6 +31,7 @@ class CausePreprocessing:
                  ):
         self.spark = spark
         self.tenant_id = tenant_id
+        self.train_date = train_date
         self.run_date = run_date
         self.model_id = model_id
         self.bucket = bucket
@@ -37,8 +39,11 @@ class CausePreprocessing:
 
         self.CONFIG = load_yaml_config('upsell/config.yml').preprocessing
 
+        prefix = s3_key(self.tenant_id, self.train_date, self.model_id)
+        self.train_data_path = f's3://{self.bucket}/{prefix}'
+
         prefix = s3_key(self.tenant_id, self.run_date, self.model_id)
-        self.data_path = f's3://{self.bucket}/{prefix}'
+        self.pred_data_path = f's3://{self.bucket}/{prefix}'
 
         self.firmo_rollup: Optional[PipelineModel] = None
         self.firmo_event_types: Optional[Dict[str, List[str]]] = None
@@ -47,41 +52,59 @@ class CausePreprocessing:
         self.event_type_names = None
 
     def run(self, dataset: str = 'train'):
+        if dataset in ['train', 'test']:
+            date = self.train_date
+            data_path = self.train_data_path
+        elif dataset == 'pred':
+            date = self.run_date
+            data_path = self.pred_data_path
+        else:
+            raise ValueError(f'Unknown dataset: {dataset}')
+
         # Load raw event data
         print('Loading raw event data...')
-        accounts = self.spark.read.parquet(f'{self.data_path}/accounts')
-        activities = self.spark.read.parquet(f'{self.data_path}/activities')
-        opps = self.spark.read.parquet(f'{self.data_path}/oppEvents')
-        intent = self.spark.read.parquet(f'{self.data_path}/intentEvents')
+        accounts = self.spark.read.parquet(f'{data_path}/accounts')
+        activities = self.spark.read.parquet(f'{data_path}/activities')
+        opps = self.spark.read.parquet(f'{data_path}/oppEvents')
+        intent = self.spark.read.parquet(f'{data_path}/intentEvents')
 
         # Create timeline events
         print('Creating timeline events...')
-        activity_events = self.create_timeline_events(accounts, activities)
-        opp_events = self.create_timeline_events(accounts, opps)
-        intent_events = self.create_timeline_events(accounts, intent)
+        activity_events = self.create_timeline_events(accounts, activities, date)
+        opp_events = self.create_timeline_events(accounts, opps, date)
+        intent_events = self.create_timeline_events(accounts, intent, date)
 
         if dataset == 'train':
             print('Sampling accounts...')
             account_sample = self.sample_accounts(accounts, activity_events, opp_events, intent_events)
-            self.save_parquet(account_sample, f'{self.data_path}/account_sample')
+            self.save_parquet(account_sample, f'{self.train_data_path}/account_sample')
 
             print('Splitting into train/test...')
             train_accounts, test_accounts = self.train_test_split(account_sample)
-            self.save_parquet(train_accounts, f'{self.data_path}/train_accounts')
-            self.save_parquet(test_accounts, f'{self.data_path}/test_accounts')
+            self.save_parquet(train_accounts, f'{self.train_data_path}/train_accounts')
+            self.save_parquet(test_accounts, f'{self.train_data_path}/test_accounts')
 
             accounts = train_accounts
 
         elif dataset == 'test':
-            accounts = self.spark.read.parquet(f'{self.data_path}/test_accounts')
+            accounts = self.spark.read.parquet(f'{self.train_data_path}/test_accounts')
 
         print(f'Preprocessing {dataset} data...')
         sparse_matrices = self.apply_preprocessing(accounts, activity_events, opp_events, intent_events,
                                                    dataset=dataset)
-        self.save_parquet(sparse_matrices, f'{self.data_path}/{dataset}_sparse_matrices')
+        self.save_parquet(sparse_matrices, f'{data_path}/{dataset}_sparse_matrices')
 
     def apply_preprocessing(self, accounts: DataFrame, activity_events: DataFrame,
                             opp_events: DataFrame, intent_events: DataFrame, dataset: str = 'train'):
+        if dataset in ['train', 'test']:
+            date = self.train_date
+            data_path = self.train_data_path
+        elif dataset == 'pred':
+            date = self.run_date
+            data_path = self.pred_data_path
+        else:
+            raise ValueError(f'Unknown dataset: {dataset}')
+
         # Clean firmographics data
         print('Cleaning firmographics data...')
         accounts_cleaned = self.clean_firmographics(accounts)
@@ -90,8 +113,8 @@ class CausePreprocessing:
             # Fit firmographic roll-up
             print('Fitting firmographic roll-up...')
             self.firmo_rollup, self.firmo_event_types = self.fit_firmographic_roll_up(accounts_cleaned)
-            self.firmo_rollup.write().overwrite().save(f'{self.data_path}/firmo_rollup_pipeline')
-            self.save_json(self.firmo_event_types, f'{self.data_path}/firmo_event_types')
+            self.firmo_rollup.write().overwrite().save(f'{self.train_data_path}/firmo_rollup_pipeline')
+            self.save_json(self.firmo_event_types, f'{self.train_data_path}/firmo_event_types')
 
             # Fit activity + intent roll-up
             print('Fitting activity + intent event roll-up...')
@@ -101,13 +124,13 @@ class CausePreprocessing:
                 intent_events.join(accounts_cleaned.select('tenant_id', 'account_id'),
                                    on=['tenant_id', 'account_id'], how='inner')
             )
-            self.save_json(self.event_type_rollup, f'{self.data_path}/event_type_rollup_pipeline')
+            self.save_json(self.event_type_rollup, f'{self.train_data_path}/event_type_rollup_pipeline')
         else:
             # Load roll-ups
             print('Loading preprocessors...')
-            self.firmo_rollup = PipelineModel.load(f'{self.data_path}/firmo_rollup_pipeline')
-            self.firmo_event_types = self.spark.read.json(f'{self.data_path}/firmo_event_types')
-            self.event_type_rollup = self.spark.read.json(f'{self.data_path}/event_type_rollup_pipeline')
+            self.firmo_rollup = PipelineModel.load(f'{self.train_data_path}/firmo_rollup_pipeline')
+            self.firmo_event_types = self.spark.read.json(f'{self.train_data_path}/firmo_event_types')
+            self.event_type_rollup = self.spark.read.json(f'{self.train_data_path}/event_type_rollup_pipeline')
 
         # Roll up firmographics and activities
         print('Rolling up firmographics...')
@@ -131,15 +154,15 @@ class CausePreprocessing:
         # Combine events
         print('Combining events...')
         all_events = self.combine_events(accounts_transformed, firmo_events, opp_events, rolled_up_events)
-        self.save_parquet(all_events, f'{self.data_path}/{dataset}_all_events')
+        self.save_parquet(all_events, f'{data_path}/{dataset}_all_events')
 
         if dataset == 'train':
             # Get event type names
             print('Getting event type names...')
             self.event_type_names = all_events.select('event_type').distinct().orderBy('event_type').coalesce(1).cache()
-            self.save_parquet(self.event_type_names, f'{self.data_path}/event_type_names')
+            self.save_parquet(self.event_type_names, f'{self.train_data_path}/event_type_names')
         else:
-            self.event_type_names = self.spark.read.parquet(f'{self.data_path}/event_type_names').cache()
+            self.event_type_names = self.spark.read.parquet(f'{self.train_data_path}/event_type_names').cache()
 
         self.n_event_types = self.event_type_names.count()
         print(f'Event types: {self.n_event_types}')
@@ -151,7 +174,7 @@ class CausePreprocessing:
 
         # Pad event sequences
         print('Padding event sequences...')
-        events_padded = self.pad_final_event_date(accounts_transformed, event_agg)
+        events_padded = self.pad_final_event_date(accounts_transformed, event_agg, date)
 
         # Convert to sparse matrices
         print('Converting to sparse matrices...')
@@ -262,13 +285,13 @@ class CausePreprocessing:
         print(f'Test accounts: {test.count()}')
         return train, test
 
-    def create_timeline_events(self, accounts: DataFrame, raw_events: DataFrame):
+    def create_timeline_events(self, accounts: DataFrame, raw_events: DataFrame, end_date: str) -> DataFrame:
         # 1. Filter to events that occurred between the account's start date and the run date
         # 2. Convert dates to a value on a number line, where the account's start date is 0
         # 3. Clean up event type names, since VectorAssembler can't handle columns with some types of punctuation
         timeline_event = raw_events\
             .join(accounts.select('tenant_id', 'account_id', 'start_dt'), on=['tenant_id', 'account_id'])\
-            .filter((col('start_dt') <= col('activity_date')) & (col('activity_date') <= lit(self.run_date)))\
+            .filter((col('start_dt') <= col('activity_date')) & (col('activity_date') <= lit(end_date)))\
             .withColumn('dt', datediff(col('activity_date'), col('start_dt')) + lit(1))\
             .select('tenant_id', 'account_id', 'dt', 'event_type', 'weight')
 
@@ -497,14 +520,14 @@ class CausePreprocessing:
             .agg(map_from_arrays(collect_list(col('event_type')), collect_list(col('weight'))).alias('events'))
         return event_agg
 
-    def pad_final_event_date(self, accounts: DataFrame, event_agg: DataFrame) -> DataFrame:
+    def pad_final_event_date(self, accounts: DataFrame, event_agg: DataFrame, last_event_dt) -> DataFrame:
         divisor = 7 if self.weekly else 1
         # 1. Get the max possible date (length of observation period) for each account
         # 2. Join to event_agg and drop accounts that already have an event vector on the max date
         # 3. Add an empty event vector on the max date for remaining accounts
         # 4. Union back to event_agg to get the full set of padded sequences for each account
         return accounts\
-            .withColumn('max_dt', ceil((datediff(lit(self.run_date), col('start_dt')) + lit(1)) / lit(divisor))) \
+            .withColumn('max_dt', ceil((datediff(lit(last_event_dt), col('start_dt')) + lit(1)) / lit(divisor))) \
             .select('tenant_id', 'account_id', 'max_dt')\
             .join(event_agg, on=['tenant_id', 'account_id'], how='inner')\
             .groupBy('tenant_id', 'account_id', 'max_dt')\
