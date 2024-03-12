@@ -149,9 +149,8 @@ def init_data_loader(event_seqs: EventSeqDataset, loader_configs: DotDict, datas
         )
         return bucketed_data_loader
     elif dataset == 'train':
-        train_data_loader, valid_data_loader = split_data_loader(
-            data_loader, loader_configs['train_validation_split']
-        )
+        train_pct = loader_configs['train_pct']
+        train_data_loader, valid_data_loader = split_data_loader(data_loader, [train_pct, 1-train_pct])
         if loader_configs['bucket_seqs']:
             train_data_loader = convert_to_bucketed_data_loader(
                 train_data_loader, keys=[x.shape[0] for x in train_data_loader.dataset]
@@ -231,7 +230,6 @@ def train(train_data_loader: DataLoader, valid_data_loader: DataLoader,
             optimizer,
             valid_data_loader,
             device=device,
-            l2_reg=train_configs['l2_reg'],
         )
         # Store training and validation metrics for this epoch
         for loss_type in ['train', 'valid']:
@@ -310,7 +308,7 @@ def train_with_tuning(device: torch.device, config: DotDict) -> ExplainableRecur
     # Create search space for hyperparameters
     search_space = {
         'data_loader': {
-            'train_validation_split': config.data_loader.train_validation_split,
+            'train_pct': config.data_loader.train_pct,
             'bucket_seqs': config.data_loader.bucket_seqs,
             'batch_size': tune.choice([2 ** i for i in range(
                 config.data_loader.batch_size.min_pow_2, config.data_loader.batch_size.max_pow_2)]),
@@ -332,7 +330,6 @@ def train_with_tuning(device: torch.device, config: DotDict) -> ExplainableRecur
             'optimizer': config.train.optimizer,
             'lr': tune.qloguniform(config.train.lr.min, config.train.lr.max, 1.e-5),
             'epochs': config.train.epochs,
-            'l2_reg': config.train.l2_reg,
             'tune_metric': config.train.tune_metric,
             'patience': config.train.patience.ray_tune,
         }

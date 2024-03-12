@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 class EventSeqDataset(Dataset):
     """
     Dataset for storing event sequences.
-    :param event_seqs: List of sparse matrices. Each row of the sparse matrix has a timestamp and one-hot encoded
+    :param event_seqs: List of sparse matrices. Each row of the sparse matrix has a timestamp and multi-hot encoded
      vector describing which event types occurred at the timestamp.
      Shape: accounts x timestamps x (event types + 1)
     :param min_length: int -> Minimum number of timestamps required for an event sequence to be included in the dataset

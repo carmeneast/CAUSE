@@ -35,6 +35,16 @@ class Decoder(nn.Module):
         return self.net1(x) + self.net2(x)
 
 
+class Clamper(nn.Module):
+    def __init__(self, min_value: Optional[float] = None, max_value: Optional[float] = None):
+        super().__init__()
+        self.min_value = min_value
+        self.max_value = max_value
+
+    def forward(self, x):
+        return torch.clamp(x, min=self.min_value, max=self.max_value)
+
+
 class ExplainableRecurrentPointProcess(nn.Module):
     def __init__(
             self,
@@ -66,22 +76,29 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.bases = self.define_basis_functions(basis_type, max_mean=max_mean, basis_means=basis_means)
 
         # Neural networks
-        # TODO: move clamping into model
-        self.max_log_basis_weight = max_log_basis_weight
-        self.embedder, self.encoder, self.dropout, self.decoder = None, None, None, None
-        self.define_model(embedding_dim, hidden_size, rnn, dropout)
+        self.embedder, self.model = None, None
+        self.define_model(embedding_dim, hidden_size, rnn, dropout, max_log_basis_weight)
 
-    def define_model(self, embedding_dim: int, hidden_size: int, rnn: str, dropout: float) -> None:
-        # TODO: Move this into nn.Sequential
+    def define_model(self, embedding_dim: int, hidden_size: int, rnn: str, dropout: float,
+                     max_log_basis_weight: float) -> None:
+        # TODO: Can embedder move into nn.Sequential?
+        #   Currently sits outside due to removing then re-appending the timestamp
         self.embedder = nn.Linear(self.n_event_types, embedding_dim, bias=False)
-        self.encoder = getattr(nn, rnn)(
+
+        encoder = getattr(nn, rnn)(
             input_size=embedding_dim + 1,
             hidden_size=hidden_size,
             batch_first=True,
             dropout=dropout,
         )
-        self.dropout = nn.Dropout(p=dropout)
-        self.decoder = Decoder(hidden_size, self.n_event_types * (self.n_bases + 1))
+        decoder = Decoder(hidden_size, self.n_event_types * (self.n_bases + 1))
+        clamper = Clamper(max_value=max_log_basis_weight)  # Cap basis weights to avoid numerical instability
+        self.model = nn.Sequential(
+            encoder,
+            nn.Dropout(p=dropout),
+            decoder,
+            clamper
+        )
 
     def define_basis_functions(self, basis_type: str, max_mean=None, basis_means=None) -> nn.ModuleList:
         bases = [Unity()]
@@ -150,27 +167,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
         type_feat = f.pad(event_emb, (0, 0, 1, 0))
         feat = torch.cat([time_feat, type_feat], dim=-1)
 
-        # ENCODE EVENT HISTORY PER ACCOUNT
+        # ENCODE EVENT HISTORY PER ACCOUNT AND DECODE INTO WEIGHTS FOR EACH BASIS FUNCTION
         # In: [batch_size, time_stamps, embedding_dim + 1]
-        # Out: [batch_size, hidden_size]
-        event_hist_emb, *_ = self.encoder(feat)
-
-        # [batch_size, hidden_size]
-        event_hist_emb_w_dropout = self.dropout(event_hist_emb)
-
-        # DECODE INTO WEIGHTS FOR EACH BASIS FUNCTION
-        # In: [batch_size, hidden_size]
         # Out: [batch_size, time_stamps, n_event_types, n_bases]
-        raw_log_basis_weights = self.decoder(event_hist_emb_w_dropout).view(
+        log_basis_weights = self.model(feat).view(
             batch_size, time_stamps, self.n_event_types, -1
         )
-
-        # Cap basis weights to avoid numerical instability
-        # TODO: Can the clamping be defined in self.define_model()?
-        #  - So that it's not redefined on every forward pass
-        #  - So we don't have to make model configs like self.max_log_basis_weight a class attribute
-        #  - Requires using a clamping function from torch.nn.functional or subclassing nn.Module
-        log_basis_weights = torch.clamp(raw_log_basis_weights, max=self.max_log_basis_weight)
 
         if target_type is not None:
             log_basis_weights = log_basis_weights[:, :, target_type: target_type + 1]
@@ -261,42 +263,34 @@ class ExplainableRecurrentPointProcess(nn.Module):
             device: Optional = None,
             **kwargs,
     ) -> Tuple[Dict[str, MetricTracker], Dict[str, MetricTracker]]:
-        train_metrics = {m: MetricTracker(metric=m) for m in ['nll', 'loss', 'l2_reg']}
+        train_metrics = {m: MetricTracker(metric=m) for m in ['nll', 'loss']}
 
         self.train()
         for batch in train_data_loader:
             if device:
                 batch = batch.to(device)
-            seq_length = (batch.abs().sum(-1) > 0).sum(-1)
-            mask = generate_sequence_mask(seq_length)
 
+            # Forward pass
             log_intensities, log_basis_weights = self.forward(
                 batch, return_weights=True
             )
-            nll = self._eval_nll(
-                batch, log_intensities, log_basis_weights, mask
-            )
-            if kwargs['l2_reg'] > 0:
-                l2_reg = (
-                        kwargs['l2_reg']
-                        * log_basis_weights.permute(2, 3, 0, 1)
-                        .masked_select(mask)
-                        .exp()
-                        .pow(2)
-                        .mean()
-                )
-            else:
-                l2_reg = 0.0
-            loss = nll + l2_reg
 
+            # Calculate loss
+            seq_length = (batch.abs().sum(-1) > 0).sum(-1)
+            mask = generate_sequence_mask(seq_length)
+            loss = torch.Tensor(self._eval_nll(
+                batch, log_intensities, log_basis_weights, mask
+            ))
+
+            # Backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            train_metrics['loss'].update(loss, batch.size(0))
-            train_metrics['nll'].update(nll, batch.size(0))
-            train_metrics['l2_reg'].update(l2_reg, seq_length.sum())
+            # Update training metrics for epoch
+            train_metrics['nll'].update(loss, batch.size(0))
 
+        # Calculate validation metrics for epoch
         if valid_data_loader:
             valid_metrics = self.evaluate(valid_data_loader, device=device)
         else:
@@ -314,17 +308,20 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 if device:
                     batch = batch.to(device)
 
-                seq_length = (batch.abs().sum(-1) > 0).sum(-1)
-                mask = generate_sequence_mask(seq_length)
-
+                # Forward pass
                 log_intensities, log_basis_weights = self.forward(
                     batch, return_weights=True, target_type=event_index
                 )
+
+                # Calculate loss
+                seq_length = (batch.abs().sum(-1) > 0).sum(-1)
+                mask = generate_sequence_mask(seq_length)
                 # TODO: calculate NLL for a specific event type
                 nll = self._eval_nll(
                     batch, log_intensities, log_basis_weights, mask
                 )
 
+                # Update metrics
                 metrics['nll'].update(nll, batch.size(0))
 
         return metrics
@@ -339,10 +336,12 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 if device:
                     batch = batch.to(device)
 
+                # Forward pass
                 log_intensities, log_basis_weights = self.forward(
                     batch, return_weights=True, target_type=event_index
                 )
 
+                # Calculate average incidence at each k
                 for k in ks:
                     p, n = self._eval_avg_incidence_at_k(batch, log_intensities, k, eps)
                     if n > 0:
@@ -362,10 +361,11 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 if device:
                     batch = batch.to(device)
 
-                seq_length = (batch.abs().sum(-1) > 0).sum(-1)
+                # Forward pass
                 _, log_basis_weights = self.forward(batch, return_weights=True)
 
                 # Get the basis weights for the last event vector in each account [batch_size, n_event_types, n_bases]
+                seq_length = (batch.abs().sum(-1) > 0).sum(-1)
                 last_log_basis_weights = torch.cat(
                     [log_basis_weights[i][j-1].unsqueeze(0) for i, j in enumerate(seq_length)])
 
@@ -390,6 +390,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
                 batch_cumulants.append(cumulants)
 
         # Stack intensities and cumulants [all accounts, n_event_types, days]
+        # TODO: Make this work as batch prediction instead of stacking all batches together
         all_intensities = torch.cat(batch_intensities, dim=0)
         all_cumulants = torch.cat(batch_cumulants, dim=0)
 

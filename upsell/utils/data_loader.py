@@ -1,19 +1,27 @@
 import random
-from typing import List, Optional, Callable
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 from torch import BoolTensor, LongTensor
 
 
-def split_data_loader(data_loader: DataLoader, ratio: float):
+def split_data_loader(data_loader: DataLoader, weights: List[float]) -> List[DataLoader]:
     """
     Split a data loader into two data loaders, each with a portion of the dataset in the original
     data loader. Useful for splitting into train and validation data loaders.
     """
     dataset = data_loader.dataset
+
     n = len(dataset)
-    lengths = [int(n * ratio), n - int(n * ratio)]
+    lengths = []
+    pct = 1.0
+    for weight in weights:
+        lengths.append(int(n * weight / pct))
+        n -= lengths[-1]
+        pct -= weight
+    assert n == 0 and pct == 0.0
+
     datasets = torch.utils.data.random_split(dataset, lengths)
 
     copied_fields = ['batch_size', 'num_workers', 'collate_fn', 'drop_last']
@@ -24,8 +32,7 @@ def split_data_loader(data_loader: DataLoader, ratio: float):
                 dataset=d, **{k: getattr(data_loader, k) for k in copied_fields}
             )
         )
-
-    return tuple(data_loaders)
+    return data_loaders
 
 
 class KeyBucketedBatchSampler(torch.utils.data.Sampler):
@@ -33,15 +40,14 @@ class KeyBucketedBatchSampler(torch.utils.data.Sampler):
     Pseudo bucketed batch sampler.
 
     Sample in a way that puts similarly-sized records into the same batch.
-    Args:
-        keys: list of keys by which the same or nearby keys are allocated
-          in the same or nearby batches.
-        batch_size:
-        drop_last: Whether to drop the last incomplete batch. Defaults to False.
-        shuffle_same_key: Whether to shuffle the instances of the same keys. Defaults to False.
+    :param keys: List[int]. list of keys by which the same or nearby keys are allocated
+        in the same or nearby batches.
+    :param batch_size: int. Batch size.
+    :param drop_last: bool. Whether to drop the last incomplete batch. Defaults to False.
+    :param shuffle_same_key: bool. Whether to shuffle the instances of the same keys. Defaults to False.
     """
 
-    def __init__(self, keys: List[int], batch_size: int, drop_last: bool = False, shuffle_same_key: bool = True):
+    def __init__(self, keys: List[int], batch_size: int, drop_last: bool = False, shuffle_same_key: bool = False):
         super().__init__(self)
         self.keys = keys
         self.batch_size = batch_size

@@ -23,7 +23,7 @@ preprocessing:
   train_size: 0.8
 
 data_loader:
-  train_validation_split: 0.85
+  train_pct: 0.85
   bucket_seqs: True
   batch_size:
     min_pow_2: 5  # 32
@@ -66,7 +66,6 @@ train:
     max: 1.e-1
     default: 1.e-3
   epochs: 150
-  l2_reg: 0
   tune_metric: 'nll'
   patience:
     no_tuning: 3
