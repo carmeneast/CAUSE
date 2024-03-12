@@ -17,11 +17,12 @@ from upsell.preprocessing.hierarchical_event_type_rollup import HierarchicalEven
     HierarchicalEventTypeRollUpModel
 from upsell.utils.s3 import s3_key
 
+spark = SparkSession.builder.getOrCreate()
+
 
 class CausePreprocessing:
 
     def __init__(self,
-                 spark: SparkSession,
                  tenant_id: int,
                  train_date: str,
                  run_date: str,
@@ -29,7 +30,6 @@ class CausePreprocessing:
                  bucket: str = 'ceasterwood',
                  weekly: bool = True
                  ):
-        self.spark = spark
         self.tenant_id = tenant_id
         self.train_date = train_date
         self.run_date = run_date
@@ -63,10 +63,10 @@ class CausePreprocessing:
 
         # Load raw event data
         print('Loading raw event data...')
-        accounts = self.spark.read.parquet(f'{data_path}/accounts')
-        activities = self.spark.read.parquet(f'{data_path}/activities')
-        opps = self.spark.read.parquet(f'{data_path}/oppEvents')
-        intent = self.spark.read.parquet(f'{data_path}/intentEvents')
+        accounts = spark.read.parquet(f'{data_path}/accounts')
+        activities = spark.read.parquet(f'{data_path}/activities')
+        opps = spark.read.parquet(f'{data_path}/oppEvents')
+        intent = spark.read.parquet(f'{data_path}/intentEvents')
 
         # Create timeline events
         print('Creating timeline events...')
@@ -87,7 +87,7 @@ class CausePreprocessing:
             accounts = train_accounts
 
         elif dataset == 'test':
-            accounts = self.spark.read.parquet(f'{self.train_data_path}/test_accounts')
+            accounts = spark.read.parquet(f'{self.train_data_path}/test_accounts')
 
         print(f'Preprocessing {dataset} data...')
         sparse_matrices = self.apply_preprocessing(accounts, activity_events, opp_events, intent_events,
@@ -129,8 +129,8 @@ class CausePreprocessing:
             # Load roll-ups
             print('Loading preprocessors...')
             self.firmo_rollup = PipelineModel.load(f'{self.train_data_path}/firmo_rollup_pipeline')
-            self.firmo_event_types = self.spark.read.json(f'{self.train_data_path}/firmo_event_types')
-            self.event_type_rollup = self.spark.read.json(f'{self.train_data_path}/event_type_rollup_pipeline')
+            self.firmo_event_types = spark.read.json(f'{self.train_data_path}/firmo_event_types')
+            self.event_type_rollup = spark.read.json(f'{self.train_data_path}/event_type_rollup_pipeline')
 
         # Roll up firmographics and activities
         print('Rolling up firmographics...')
@@ -162,7 +162,7 @@ class CausePreprocessing:
             self.event_type_names = all_events.select('event_type').distinct().orderBy('event_type').coalesce(1).cache()
             self.save_parquet(self.event_type_names, f'{self.train_data_path}/event_type_names')
         else:
-            self.event_type_names = self.spark.read.parquet(f'{self.train_data_path}/event_type_names').cache()
+            self.event_type_names = spark.read.parquet(f'{self.train_data_path}/event_type_names').cache()
 
         self.n_event_types = self.event_type_names.count()
         print(f'Event types: {self.n_event_types}')
@@ -197,9 +197,13 @@ class CausePreprocessing:
         account_types = accounts.select('tenant_id', 'account_id') \
             .join(
                 opp_events.filter(col('event_type').isin(
-                    'opened_new_business_opportunity', 'opened_post_customer_opportunity'))
-                .select('tenant_id', 'account_id')
-                .distinct()
+                    'opened_new_business_opportunity', 'opened_post_customer_opportunity',
+                    'opened_unselected_new_business_opportunity', 'opened_unselected_post_customer_opportunity',
+                ))
+                .withColumn('meets_selector_criteria', when(col('event_type').rlike('_unselected_'), lit(0))
+                            .otherwise(lit(1)))
+                .groupBy('tenant_id', 'account_id')
+                .agg(max('meets_selector_criteria').alias('meets_selector_criteria'))
                 .withColumn('open_opp', lit(1)),
                 on=['tenant_id', 'account_id'],
                 how='left'
@@ -214,13 +218,14 @@ class CausePreprocessing:
                 on=['tenant_id', 'account_id'],
                 how='left'
             )\
-            .na.fill(0, ['open_opp', 'has_activity', 'has_intent'])\
+            .na.fill(0, ['meets_selector_criteria', 'open_opp', 'has_activity', 'has_intent'])\
             .withColumn('type', when(col('open_opp') == lit(1), lit('positive'))
                         .when(col('has_activity') == lit(1), lit('neg_w_activity'))
                         .when(col('has_intent') == lit(1), lit('neg_w_intent'))
                         .otherwise(lit('neg_w_none')))\
             .withColumn('rand', rand(seed=self.CONFIG.seed))\
-            .orderBy('rand')
+            .orderBy(desc('meets_selector_criteria'), 'rand')\
+            .cache()
 
         # Get positive accounts
         pos = account_types.filter(col('type') == lit('positive'))
@@ -245,7 +250,7 @@ class CausePreprocessing:
         """)
 
         # Calculate the largest sample we can create with the available accounts
-        n_pos = np.min([n_pos, self.CONFIG.sampling.max_positives])
+        n_pos = int(np.min([n_pos, self.CONFIG.sampling.max_positives]))
         n_pos = enforce_pos_to_neg_ratio(n_pos, n_neg_w_act, self.CONFIG.sampling.neg_w_activity_prop)
         n_pos = enforce_pos_to_neg_ratio(n_pos, n_neg_w_int, self.CONFIG.sampling.neg_w_intent_prop)
         n_pos = enforce_pos_to_neg_ratio(n_pos, n_neg_w_none, self.CONFIG.sampling.neg_w_none_prop)
@@ -430,7 +435,7 @@ class CausePreprocessing:
 
         firmo_rollup = Pipeline(stages=transformers)
         return (firmo_rollup.fit(train_accounts),
-                self.spark.createDataFrame(feat_event_types, schema=['feature', 'event_types']))
+                spark.createDataFrame(feat_event_types, schema=['feature', 'event_types']))
 
     def fit_event_type_roll_up(self, train_activities: DataFrame, train_intent_events: DataFrame) -> DataFrame:
         activity_transformer = HierarchicalEventTypeRollUp(
@@ -456,7 +461,7 @@ class CausePreprocessing:
         intent_surge = surge_transformer.fit(
             train_intent_events.filter(col('event_type').startswith('intent_surge__'))
         ).event_types
-        return self.spark.createDataFrame(
+        return spark.createDataFrame(
             [
                 ('activities', activities),
                 ('db_keyword_intent', kwd_intent),

@@ -86,7 +86,8 @@ class TruePrecisionOpps:
                                          lit('Post-Customer'))
                         .when(col('created_date').isNotNull() & (col('customer_stage') == lit(0)), lit('New Business'))
                         )\
-            .select('tenant_id', 'account_id', 'dt', 'label', 'customer_stage', 'opp_type', 'days_since_run_date')\
+            .select('tenant_id', 'account_id', 'dt', 'label', 'customer_stage', 'meets_selector_criteria', 'opp_type',
+                    'days_since_run_date')\
             .orderBy('tenant_id', 'account_id')
 
     def get_save_opps(self) -> None:
@@ -97,17 +98,18 @@ class TruePrecisionOpps:
             .write\
             .option('header', 'true')\
             .mode('overwrite')\
-            .csv(f's3://{self.bucket}/{prefix}truePrecision/')
+            .csv(f's3://{self.bucket}/{prefix}true_precision/')
 
 
 if __name__ == '__main__':
     _tenant_ids = ['1681']
-    _model_id = '2'
+    _model_ids = ['2']
     _run_date = '2023-11-01'
     _days_of_opps = 28
     _opportunity_selector = ''
     _bucket = 'ceasterwood'
 
     for _tenant_id in _tenant_ids:
-        tp = TruePrecisionOpps(_tenant_id, _model_id, _run_date, _opportunity_selector, _days_of_opps, _bucket)
-        tp.get_save_opps()
+        for _model_id in _model_ids:
+            tp = TruePrecisionOpps(_tenant_id, _model_id, _run_date, _opportunity_selector, _days_of_opps, _bucket)
+            tp.get_save_opps()

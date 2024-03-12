@@ -40,28 +40,57 @@ def pd_read_s3_multiple_files(bucket, key, file_suffix='.csv', verbose=False):
     return final
 
 
-def s3_key(tenant_id, run_date, model_id=1):
-    return f'upsell/{tenant_id}/{model_id}/{run_date}/'
+def s3_key(tenant_id, run_date=None, model_id=None):
+    key = f'opportunity_scoring/{tenant_id}/{model_id}/'
+    if run_date:
+        key += f'{run_date}/'
+    return key
 
 
 def load_event_type_names(bucket, tenant_id, model_id, run_date):
-    key = s3_key(tenant_id, run_date, model_id)
-    return pd_read_s3_multiple_files(bucket, key+'event_type_names/', '.parquet')
+    key = s3_key(tenant_id, None, model_id)
+    obj = boto3.client('s3').get_object(Bucket=bucket, Key=key+'training/preprocess/event_names.csv')
+    file = pd.read_csv(BytesIO(obj['Body'].read()))
+    return file
 
 
-def load_numpy_data(bucket, tenant_id, run_date, model_id, dataset='train'):
-    key = s3_key(tenant_id, run_date, model_id)
-    filename = f'{dataset}_model_data.npz'
+def get_batch_idxs(bucket, tenant_id, model_id, run_date):
+    key = s3_key(tenant_id, run_date, model_id) + 'scoring/prep/'
+    s3_keys = [item.key for item in boto3.resource('s3').Bucket(bucket).objects.filter(Prefix=key)
+               if item.key.endswith('.csv')]
+    return range(len(s3_keys))
+
+
+def load_numpy_data(bucket, tenant_id, run_date, model_id, dataset='train', batch_idx=None):
+    # Load event seqs
+    if dataset in ['train', 'test']:
+        key = s3_key(tenant_id, None, model_id)
+        filename = f'training/preprocess/{dataset}_arrays.np'
+    else:
+        key = s3_key(tenant_id, run_date, model_id)
+        filename = f'scoring/preprocess/{dataset}_arrays_{batch_idx:04}.np'
     print(f'Loading s3://{bucket}/{key}{filename}')
     with BytesIO() as obj:
         boto3.resource('s3').Bucket(bucket).download_fileobj(key+filename, obj)
         obj.seek(0)
-        data = np.load(obj, allow_pickle=True)
-
-        event_seqs = data['event_seqs']
+        event_seqs = np.load(obj, allow_pickle=True)
         print('event_seqs', len(event_seqs), event_seqs[0].shape[1])
-        account_ids = data['account_ids']
-        print('account_ids', account_ids.shape)
+
+    # Load account ids
+    if dataset in ['train', 'test']:
+        filename = f'training/preprocess/{dataset}_transformed.csv'
+    else:
+        filename = f'scoring/preprocess/{dataset}_transformed_{batch_idx:04}.csv'
+    print(f'Loading s3://{bucket}/{key}{filename}')
+    obj = boto3.client('s3').get_object(Bucket=bucket, Key=key+filename)
+    account_ids = pd.read_csv(BytesIO(obj['Body'].read()), sep='\t', escapechar='\\', encoding='utf-8',
+                              doublequote=True)
+    account_ids = account_ids[['tenant_id', 'account_id']].drop_duplicates()\
+        .sort_values('account_id')\
+        .reset_index(drop=True)
+    account_ids['tenant_id'] = account_ids['tenant_id'].astype(int)
+    account_ids['account_id'] = account_ids['account_id'].astype(int)
+    print('account_ids', account_ids.shape)
 
     return {
         'event_seqs': event_seqs,
@@ -78,18 +107,18 @@ def save_pytorch_dataset(dataset, bucket, tenant_id, run_date, model_id, name):
 
 
 def save_pytorch_model(model, bucket, tenant_id, run_date, model_id=1):
-    key = s3_key(tenant_id, run_date, model_id)
+    key = s3_key(tenant_id, None, model_id)
     s3 = boto3.client('s3')
     buffer = BytesIO()
     torch.save(model, buffer)
-    s3.put_object(Bucket=bucket, Key=key+'model.pt', Body=buffer.getvalue())
+    s3.put_object(Bucket=bucket, Key=key+'model/rnn/model.pt', Body=buffer.getvalue())
 
 
-def load_pytorch_object(bucket, tenant_id, run_date, model_id, name):
-    key = s3_key(tenant_id, run_date, model_id)
+def load_pytorch_model(bucket, tenant_id, run_date, model_id):
+    key = s3_key(tenant_id, None, model_id)
     s3 = boto3.resource('s3')
     with BytesIO() as data:
-        s3.Bucket(bucket).download_fileobj(key+name+'.pt', data)
+        s3.Bucket(bucket).download_fileobj(key+'model/rnn/model.pt', data)
         data.seek(0)
         obj = torch.load(data)
     return obj

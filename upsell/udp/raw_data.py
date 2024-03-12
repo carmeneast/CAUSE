@@ -361,7 +361,7 @@ class RawEvents:
 
 if __name__ == '__main__':
     _tenant_ids = ['227', '358', '366', '1309', '1681']
-    _run_date = '2023-11-01'
+    _run_dates = ['2023-11-01']
     _model_id = '2'
     _activity_months = 12
     _intent_months = 3
@@ -371,21 +371,22 @@ if __name__ == '__main__':
 
     # Create datasets for each tenant and save to S3
     all_metrics = None
-    for _tenant_id in _tenant_ids:
-        print(f'=== {_tenant_id} ===')
-        raw_events = RawEvents(_tenant_id, _run_date, _model_id, _activity_months, _intent_months, _bucket,
-                               _opportunity_selector, _activity_selector)
-        raw_events.main()
+    for _run_date in _run_dates:
+        for _tenant_id in _tenant_ids:
+            print(f'=== {_tenant_id} / {_run_date} ===')
+            raw_events = RawEvents(_tenant_id, _run_date, _model_id, _activity_months, _intent_months, _bucket,
+                                   _opportunity_selector, _activity_selector)
+            raw_events.main()
 
-        # Combine metrics datasets
-        _prefix = s3_key(_tenant_id, _run_date, _model_id)
-        tenant_metrics = spark.read.json(f's3://{_bucket}/{_prefix}/metrics/events/')
-        tenant_metrics.show()
+            # Combine metrics datasets
+            _prefix = s3_key(_tenant_id, _run_date, _model_id)
+            tenant_metrics = spark.read.json(f's3://{_bucket}/{_prefix}/metrics/events/')
+            tenant_metrics.show()
 
-        all_metrics = all_metrics.unionByName(tenant_metrics) if all_metrics else tenant_metrics
+            all_metrics = all_metrics.unionByName(tenant_metrics) if all_metrics else tenant_metrics
 
-    _prefix = s3_key('all-tenant-metrics', _run_date, _model_id)
-    all_metrics.coalesce(1) \
-        .write \
-        .mode('overwrite') \
-        .json(f's3://{_bucket}/{_prefix}/events/')
+        _prefix = s3_key('all-tenant-metrics', _run_date, _model_id)
+        all_metrics.coalesce(1) \
+            .write \
+            .mode('overwrite') \
+            .json(f's3://{_bucket}/{_prefix}/events/')

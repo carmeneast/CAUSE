@@ -17,11 +17,13 @@ from upsell.metric_tracker import MetricTracker
 from upsell.rnn import ExplainableRecurrentPointProcess
 from upsell.utils.data_loader import split_data_loader, convert_to_bucketed_data_loader
 from upsell.utils.env import get_freer_gpu, set_rand_seed
-from upsell.utils.s3 import load_event_type_names, load_numpy_data, load_pytorch_object, \
+from upsell.utils.s3 import get_batch_idxs, load_event_type_names, load_numpy_data, load_pytorch_model, \
     save_pytorch_dataset, save_pytorch_model, save_attributions
 
+BUCKET = 'opportunity-scoring-testing'
 
-def init_env(tenant_id: int, model_id: str, run_date: str, bucket: str = 'ceasterwood') -> Tuple[torch.device, DotDict]:
+
+def init_env(tenant_id: int, model_id: str, run_date: str, bucket: str = BUCKET) -> Tuple[torch.device, DotDict]:
     config = load_yaml_config('upsell/config.yml')
     set_rand_seed(config.env.seed, config.env.cuda)
     device = get_device(cuda=config.env.cuda)
@@ -79,18 +81,23 @@ def run(device: torch.device, config: DotDict, tune_params: bool = True) -> None
         print(attribution_matrix.shape)
 
     # Predict future event intensities on test set
-    pred_event_seqs = load_event_seqs(config.tenant_id, config.model_id, config.run_date, dataset='pred')
-    intensities, cumulants = predict(
-        pred_event_seqs,
-        model,
-        device,
-        loader_configs=config.data_loader,
-        time_steps=range(config.predict.min_time_steps, config.predict.max_time_steps + 1)
-    )
-    for dataset, name in [(intensities, 'event_intensities'), (cumulants, 'event_cumulants')]:
-        print(name, dataset.shape)
-        save_pytorch_dataset(dataset, config.bucket, config.tenant_id,
-                             config.run_date, config.model_id, name)
+    batch_idxs = get_batch_idxs(config.bucket, config.tenant_id, config.model_id, config.run_date)
+    for batch_idx in batch_idxs:
+        print(f'Making predictions for batch idx {batch_idx} of {len(batch_idxs)}')
+        pred_event_seqs = load_event_seqs(config.tenant_id, config.model_id, config.run_date, dataset='predict',
+                                          batch_idx=batch_idx)
+        intensities, cumulants = predict(
+            pred_event_seqs,
+            model,
+            device,
+            loader_configs=config.data_loader,
+            time_steps=range(config.predict.min_time_steps, config.predict.max_time_steps + 1)
+        )
+        for dataset, name in [(intensities, f'scoring/scored/event_intensities_{batch_idx:04}'),
+                              (cumulants, f'scoring/scored/event_cumulants_{batch_idx:04}')]:
+            print(name, dataset.shape)
+            save_pytorch_dataset(dataset, config.bucket, config.tenant_id,
+                                 config.run_date, config.model_id, name)
 
 
 def get_device(cuda: bool, dynamic: bool = False) -> torch.device:
@@ -104,9 +111,9 @@ def get_device(cuda: bool, dynamic: bool = False) -> torch.device:
     return device
 
 
-def load_event_seqs(tenant_id: int, model_id: str, run_date: str, dataset: str = 'train') -> EventSeqDataset:
-    bucket = 'ceasterwood'
-    data = load_numpy_data(bucket, tenant_id, run_date, model_id, dataset)
+def load_event_seqs(tenant_id: int, model_id: str, run_date: str, dataset: str = 'train', batch_idx: int = None)\
+        -> EventSeqDataset:
+    data = load_numpy_data(BUCKET, tenant_id, run_date, model_id, dataset, batch_idx)
     event_seqs = data['event_seqs']
 
     if dataset == 'test':
@@ -180,7 +187,7 @@ def train(train_data_loader: DataLoader, valid_data_loader: DataLoader,
           model: ExplainableRecurrentPointProcess, train_configs: DotDict,
           tenant_id: int, model_id: str, run_date: str, filepath: str,
           device: Optional[torch.device] = None, tune_params: bool = True) -> ExplainableRecurrentPointProcess:
-    bucket = 'ceasterwood'
+    bucket = BUCKET
     patience = train_configs['patience'] if tune_params else train_configs.patience.no_tuning
 
     if device is None:
@@ -283,7 +290,7 @@ def train(train_data_loader: DataLoader, valid_data_loader: DataLoader,
 
     if not tune_params:
         # Reset model to the last-saved (best) version of the model
-        model = load_pytorch_object(bucket, tenant_id, run_date, model_id, 'model')
+        model = load_pytorch_model(bucket, tenant_id, run_date, model_id)
 
         # Save training history
         history.to_csv(f'{filepath}/history.csv', index=False)
@@ -375,13 +382,16 @@ def calculate_test_metrics(event_seqs: EventSeqDataset, model: ExplainableRecurr
     metrics = dict()
     avg_incidences = pd.DataFrame({'k': ks})
 
-    for event_type in ['all_events', 'opened_new_business_opportunity', 'opened_post_customer_opportunity']:
-        if event_type == 'all_events':
+    for event_type in ['All Events', 'Opened New Business Opportunity', 'Opened Post-Customer Opportunity']:
+        if event_type == 'All Events':
             event_idx = None
             # TODO: make this work for individual events
             metrics[event_type] = model.evaluate(data_loader, event_index=event_idx, device=device)
         else:
-            event_idx = np.where(np.array(event_type_names) == event_type)[0][0]
+            try:
+                event_idx = np.where(np.array(event_type_names) == event_type)[0][0]
+            except IndexError:
+                continue
         curve = model.generate_calibration_curve(data_loader, ks, event_index=event_idx, device=device)
         avg_incidences[event_type] = [float(curve[k].avg) for k in ks]
 
@@ -433,7 +443,7 @@ def plot_avg_incidence_at_k(avg_incidences: pd.DataFrame, filepath: Optional[str
 
 def predict(event_seqs: EventSeqDataset, model: ExplainableRecurrentPointProcess, device: torch.device,
             loader_configs: DotDict, time_steps: list[int] = range(1, 5)):
-    data_loader = init_data_loader(event_seqs, loader_configs, dataset='pred')
+    data_loader = init_data_loader(event_seqs, loader_configs, dataset='predict')
     intensities, cumulants = \
         model.predict_future_event_intensities(data_loader, device, time_steps)
     return intensities, cumulants
@@ -441,8 +451,8 @@ def predict(event_seqs: EventSeqDataset, model: ExplainableRecurrentPointProcess
 
 if __name__ == '__main__':
     TENANT_ID = 1309
-    RUN_DATE = '2023-11-01'
-    BUCKET = 'ceasterwood'
+    RUN_DATE = '2024-01-10'
+    BUCKET = 'opportunity-scoring-testing'
     MODEL_ID = '2'
     TUNE_PARAMS = True
 
