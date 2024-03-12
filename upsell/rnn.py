@@ -76,7 +76,7 @@ class ExplainableRecurrentPointProcess(nn.Module):
         self.bases = self.define_basis_functions(basis_type, max_mean=max_mean, basis_means=basis_means)
 
         # Neural networks
-        self.embedder, self.model = None, None
+        self.embedder, self.encoder, self.model = None, None, None
         self.define_model(embedding_dim, hidden_size, rnn, dropout, max_log_basis_weight)
 
     def define_model(self, embedding_dim: int, hidden_size: int, rnn: str, dropout: float,
@@ -85,7 +85,9 @@ class ExplainableRecurrentPointProcess(nn.Module):
         #   Currently sits outside due to removing then re-appending the timestamp
         self.embedder = nn.Linear(self.n_event_types, embedding_dim, bias=False)
 
-        encoder = getattr(nn, rnn)(
+        # TODO: Can encoder move into nn.Sequential?
+        #    Currently sits outside due to returning a tuple
+        self.encoder = getattr(nn, rnn)(
             input_size=embedding_dim + 1,
             hidden_size=hidden_size,
             batch_first=True,
@@ -94,7 +96,8 @@ class ExplainableRecurrentPointProcess(nn.Module):
         decoder = Decoder(hidden_size, self.n_event_types * (self.n_bases + 1))
         clamper = Clamper(max_value=max_log_basis_weight)  # Cap basis weights to avoid numerical instability
         self.model = nn.Sequential(
-            encoder,
+            # embedder,
+            # encoder,
             nn.Dropout(p=dropout),
             decoder,
             clamper
@@ -167,10 +170,15 @@ class ExplainableRecurrentPointProcess(nn.Module):
         type_feat = f.pad(event_emb, (0, 0, 1, 0))
         feat = torch.cat([time_feat, type_feat], dim=-1)
 
-        # ENCODE EVENT HISTORY PER ACCOUNT AND DECODE INTO WEIGHTS FOR EACH BASIS FUNCTION
+        # ENCODE EVENT HISTORY PER ACCOUNT
         # In: [batch_size, time_stamps, embedding_dim + 1]
+        # Out: [batch_size, hidden_size]
+        event_hist_emb, *_ = self.encoder(feat)
+
+        # DECODE INTO WEIGHTS FOR EACH BASIS FUNCTION
+        # In: [batch_size, hidden_size]
         # Out: [batch_size, time_stamps, n_event_types, n_bases]
-        log_basis_weights = self.model(feat).view(
+        log_basis_weights = self.model(event_hist_emb).view(
             batch_size, time_stamps, self.n_event_types, -1
         )
 
