@@ -17,7 +17,7 @@ def split_data_loader(data_loader: DataLoader, weights: List[float]) -> List[Dat
     lengths = []
     pct = 1.0
     for weight in weights:
-        lengths.append(int(n * weight / pct))
+        lengths.append(round(n * weight / pct))
         n -= lengths[-1]
         pct -= weight
     assert n == 0 and pct == 0.0

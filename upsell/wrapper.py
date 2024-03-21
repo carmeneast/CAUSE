@@ -448,7 +448,7 @@ def predict(event_seqs: EventSeqDataset, model: ExplainableRecurrentPointProcess
 
 if __name__ == '__main__':
     TENANT_ID = 1309
-    RUN_DATE = '2024-01-10'
+    RUN_DATE = '2024-01-14'
     BUCKET = 'opportunity-scoring-testing'
     MODEL_ID = '2'
     TUNE_PARAMS = True
